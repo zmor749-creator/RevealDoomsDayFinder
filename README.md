@@ -1,6 +1,6 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.4.0.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.4.1.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
@@ -30,6 +30,23 @@ Bu, önceden indirdiğiniz yerel scripti çalıştırır; internetten kod indiri
 
 Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kullanıcının Desktop, Downloads, Documents, Temp, LocalAppData ve Roaming dizinlerini inceler. Tüm diskler veya tüm kullanıcı hesapları otomatik taranmaz. Özel kurulumlar için Fast/File/ADS modunda açık yol verin. Menüden tekrar tekrar tarama yapılabilir; komut satırı modu sonuçları yazıp çağıran PowerShell'e döner.
 
+### 1.4.1 — sade sonuç ekranı
+
+Varsayılan sonuç ekranında sayaçlar, hash, bulgu tablosu ve uzun teknik açıklamalar yazılmaz. Doğrulanmış mevcut dosya bulunursa yalnızca:
+
+```text
+DOOMSDAY DETECTED
+File: C:\...\performance.jar
+```
+
+Birden fazla doğrulanmış dosya varsa her tam yol bir kez listelenir. Kesin eşleşme yoksa yalnızca bir sonuç satırı gösterilir: `NO EVIDENCE FOUND`, `REVIEW REQUIRED` veya `INCONCLUSIVE`. Eksik kaynaklar veya doğrulanmamış imzalar temiz sonuç diye sunulmaz. Doğrulanmış bulgu yanında eksik tarama varsa bir ek kapsam uyarısı kalır. Bu yalnızca sunum değişikliğidir; kanıtlar, tespit mantığı ve tarama kapsamı değiştirilmedi.
+
+JSON/TXT raporları otomatik olarak `Reports` klasörüne kaydedilir; başarılı otomatik kayıt konsola dosya linkleri basmaz. Raporlama başarısızsa kısa uyarı gösterilir. Eski ayrıntılı ekran isteğe bağlıdır:
+
+```powershell
+.\DoomsDayFinder.ps1 -Mode Fast -DetailedOutput
+```
+
 ### 1.4.0 — hedefli Fast modu
 
 Bu mod geniş forensic incelemenin yerine geçen bir tam disk taraması değildir. Tarama kapsamı konsolda ve JSON/TXT raporda açıkça yazılır:
@@ -42,7 +59,7 @@ Bu mod geniş forensic incelemenin yerine geçen bir tam disk taraması değildi
 - Nested arşiv, byte pattern, hash, metadata ve temiz hash çelişkisi korunur. **DETECTED öncesindeki bağımsız ikinci okuma her zaman ayrıntılı class ayrıştırmasını da yapar.** Doğrulanmamış topluluk pattern'i kesin tespit olarak sunulmaz.
 - Yalnızca bu hedefli dosya kümesinin ADS'leri incelenir. Normal Zone.Identifier hile değildir. Tüm AppData ADS'leri taranmış sayılmaz.
 - Varsayılan Fast; USN, tarayıcı geçmişi, olay kayıtları ve genel Desktop/AppData gezisi başlatmaz. Prefetch yoksa bunlara sessizce geçmez. Eksik kaynak eksik olarak kalır. Eksik tarihsel dosya `DELETED` sayılmaz; ad benzerliği varsa `REVIEW / UNKNOWN` olur.
-- Mor tek satır gerçek aday toplamını ve aktif işçileri gösterir. Doğrulanmış bir sonuç tamamlandığında dosya yolu final aşamasını beklemeden yazılır. Dosya sayısı, byte boyutu, disk ve Defender incelemesi süreyi etkiler: **30 saniye garantisi yoktur**.
+- Mor tek satır gerçek aday toplamını ve aktif işçileri gösterir. Doğrulanmış sonuç varsayılan olarak tarama sonunda bir kez yazılır; `-DetailedOutput` seçilirse ara bulgular da gösterilir. Dosya sayısı, byte boyutu, disk ve Defender incelemesi süreyi etkiler: **30 saniye garantisi yoktur**.
 
 [Örnek alınan topluluk scripti](https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1) hedefli Prefetch toplaması yanında 30-class ve dosya-boyutu elemesi yapar. Bu eleme ve kesinlik mantığı alınmadı. Yeni Prefetch ayrıştırıcısı [libscca format belgesi](https://github.com/libyal/libscca/blob/main/documentation/Windows%20Prefetch%20File%20%28PF%29%20format.asciidoc) ve [Windows decompression API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-rtldecompressbufferex) temelinde yazıldı. Topluluk scriptinin hız/tespit oranı bağımsız olarak ölçülmedi.
 

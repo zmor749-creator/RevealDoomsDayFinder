@@ -368,13 +368,59 @@ function New-PrefetchFixture {
     return ,([byte[]]($prefix+$names+$volume))
 }
 
-Test-Case 'Review findings show their full path in the console, not just a truncated filename' {
+Test-Case 'Explicit detailed output retains full paths for review findings' {
     Set-TestDatabase
     $s=New-ScanState Fast
     [void]$s.Findings.Add((New-Finding -CurrentName 'DoomsDay.jar' -FullPath 'C:\fixture\full-path\DoomsDay.jar' -Verdict REVIEW -Status UNKNOWN -DetectionReasons @('Filename-only fixture.')))
     Complete-ScanState $s
-    $output=Show-ScanComplete $s 6>&1 | Out-String
+    $output=Show-ScanComplete $s -Detailed 6>&1 | Out-String
     Assert-True ($output.Contains('C:\fixture\full-path\DoomsDay.jar'))
+}
+
+Test-Case 'Default result is exactly detected plus full path without metadata or tables' {
+    Set-TestDatabase @((New-TestSignature SHA256 ('A'*64)))
+    $s=New-ScanState Fast
+    [void]$s.Findings.Add((New-Finding -Family DoomsDay -CurrentName 'renamed.jar' -FullPath 'C:\fixture\renamed.jar' -Verdict DETECTED -VerificationStatus VERIFIED -SHA256 ('A'*64) -Confidence 100 -DetectionReasons @('Synthetic confirmed result.')))
+    for ($i=0; $i -lt 50; $i++) { [void]$s.Findings.Add((New-Finding -CurrentName "info-$i.dll" -FullPath "C:\fixture\info-$i.dll" -Verdict INFO)) }
+    $s.Findings.Add($s.Findings[0]) | Out-Null
+    $lines=@(Show-ScanComplete $s 6>&1 | ForEach-Object { $_.ToString() })
+    Assert-True ($lines.Count -eq 2 -and $lines[0] -ceq 'DOOMSDAY DETECTED' -and $lines[1] -ceq 'File: C:\fixture\renamed.jar')
+    Assert-True ($s.Findings.Count -eq 52) 'Presentation must not remove evidence from the report.'
+}
+
+Test-Case 'Compact output cannot promote unverified, conflicting or other-family results' {
+    Set-TestDatabase @((New-TestSignature SHA256 ('A'*64)))
+    foreach ($case in @(@('SUSPICIOUS','UNVERIFIED','DoomsDay'),@('HIGH CONFIDENCE','PROBABLE','DoomsDay'),@('DETECTED','PENDING','DoomsDay'),@('DETECTED','CONFLICTING','DoomsDay'),@('DETECTED','VERIFIED','Other'))) {
+        $s=New-ScanState Fast
+        [void]$s.Findings.Add((New-Finding -Family $case[2] -FullPath 'C:\fixture\unverified.jar' -Verdict $case[0] -VerificationStatus $case[1] -Confidence 100))
+        $lines=@(Show-ScanComplete $s 6>&1 | ForEach-Object { $_.ToString() })
+        Assert-True ($lines.Count -eq 1 -and $lines[0] -notmatch 'DOOMSDAY DETECTED|unverified.jar')
+    }
+}
+
+Test-Case 'Compact partial coverage is not presented as a clean result' {
+    Set-TestDatabase @((New-TestSignature SHA256 ('A'*64)))
+    $s=New-ScanState Fast; $s.FilesSkipped=1
+    $lines=@(Show-ScanComplete $s 6>&1 | ForEach-Object { $_.ToString() })
+    Assert-True ($lines.Count -eq 1 -and $lines[0] -like 'INCONCLUSIVE*')
+    [void]$s.Findings.Add((New-Finding -Family DoomsDay -FullPath 'C:\fixture\verified.jar' -Verdict DETECTED -VerificationStatus VERIFIED))
+    $lines=@(Show-ScanComplete $s 6>&1 | ForEach-Object { $_.ToString() })
+    Assert-True ($lines.Count -eq 3 -and $lines[0] -ceq 'DOOMSDAY DETECTED' -and $lines[2] -like 'INCONCLUSIVE*')
+}
+
+Test-Case 'Quiet report export still writes all findings and evidence without report-path chatter' {
+    Set-TestDatabase
+    $s=New-ScanState Fast
+    [void]$s.Findings.Add((New-Finding -FullPath 'C:\fixture\review.jar' -Verdict REVIEW -Evidence @([pscustomobject]@{ Source='fixture'; Detail='preserved' })))
+    $oldReportDirectory=$script:ReportDirectory
+    $script:ReportDirectory=Join-Path $testDirectory 'QuietReports'
+    try {
+        $output=@(Export-ScanReport $s -Quiet 6>&1)
+        Assert-True ($output.Count -eq 1 -and $output[0].PSObject.Properties['Json'])
+        $report=Get-Content -LiteralPath $output[0].Json -Raw | ConvertFrom-Json
+        Assert-True ($report.Findings.Count -eq 1 -and $report.Findings[0].Evidence[0].Detail -eq 'preserved')
+        Assert-True ((Get-Content -LiteralPath $output[0].Text -Raw).Contains('C:\fixture\review.jar'))
+    } finally { $script:ReportDirectory=$oldReportDirectory }
 }
 
 Test-Case 'Prefetch supported layouts extract Unicode paths, volumes and run count' {

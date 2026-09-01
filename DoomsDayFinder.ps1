@@ -16,6 +16,7 @@ param(
     [switch]$Deep,
     [switch]$NoPause,
     [switch]$PassThru,
+    [switch]$DetailedOutput,
     [ValidateRange(1,8)][int]$Workers = [Math]::Max(1,[Math]::Min(4,[Environment]::ProcessorCount))
 )
 
@@ -24,7 +25,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.4.0'
+$script:ToolVersion = '1.4.1'
+$script:DetailedOutput = [bool]$DetailedOutput
 $script:AnalysisProfile = 'Detailed'
 $script:PrefetchNativeApi = $null
 $script:ScannerScriptPath = $MyInvocation.MyCommand.Path
@@ -1350,7 +1352,7 @@ function Merge-WorkerResult {
     foreach ($name in @('Findings','Evidence','Integrity','Processes','AnalyzedSources','UnavailableSources')) {
         foreach ($record in $part.$name) { [void]$State.$name.Add($record) }
     }
-    if ($State.Mode -eq 'Fast') {
+    if ($State.Mode -eq 'Fast' -and $script:DetailedOutput) {
         foreach ($finding in $part.Findings) {
             if ($finding.Verdict -eq 'DETECTED' -and $finding.VerificationStatus -eq 'VERIFIED') {
                 Write-Color ("[DETECTED / VERIFIED] {0} | {1} | {2}" -f $finding.Path,$finding.Category,$finding.SHA256) Red
@@ -2677,10 +2679,32 @@ function Complete-ScanState {
     $script:LastReport = $State
 }
 
-function Show-ScanComplete {
+function Show-CompactScanResult {
     param($State)
+    # Presentation only: evidence, scoring, verification and JSON/TXT stay intact.
+    $detected=@($State.Findings | Where-Object {
+        $null -ne $_ -and $_.Verdict -eq 'DETECTED' -and $_.VerificationStatus -eq 'VERIFIED' -and
+        $_.Family -eq 'DoomsDay' -and -not [string]::IsNullOrWhiteSpace([string]$_.Path)
+    })
+    $partial=$State.FilesSkipped -gt 0 -or $State.CorruptedUnreadable -gt 0 -or $State.PartialFiles -gt 0 -or $State.UnavailableSources.Count -gt 0
+    if ($detected.Count -gt 0) {
+        Write-Color 'DOOMSDAY DETECTED' Red
+        foreach ($filePath in @($detected | Select-Object -ExpandProperty Path | Sort-Object -Unique)) { Write-Color ("File: $filePath") Red }
+        if ($partial) { Write-Color 'INCONCLUSIVE - Some other artifacts could not be analyzed.' Yellow }
+    } elseif ($partial -or $State.VerifiedSignatureCount -eq 0) {
+        Write-Color 'INCONCLUSIVE - No verified DoomsDay detection.' Yellow
+    } elseif (@($State.Findings | Where-Object { $null -ne $_ -and $_.Verdict -ne 'INFO' }).Count -gt 0) {
+        Write-Color 'REVIEW REQUIRED - No verified DoomsDay detection.' Yellow
+    } else {
+        Write-Color 'NO EVIDENCE FOUND - In the analyzed sources.' Green
+    }
+}
+
+function Show-ScanComplete {
+    param($State,[switch]$Detailed=$script:DetailedOutput)
     if ($null -eq $State) { throw 'Scan state is unavailable.' }
     if ($null -eq $State.CompletedUtc) { Complete-ScanState $State }
+    if (-not $Detailed) { Show-CompactScanResult $State; return }
     Write-Section 'SCAN COMPLETE'
     if ($State.Scope) { Write-Color ("Scope: $($State.Scope)") Magenta }
     $rows = [ordered]@{
@@ -2748,7 +2772,7 @@ function Convert-ReportToText {
 }
 
 function Export-ScanReport {
-    param($State = $script:LastReport)
+    param($State = $script:LastReport,[switch]$Quiet)
     if ($null -eq $State) { Write-Color '[WARNING] No completed scan is available to export.' Yellow; return $null }
     try {
         if ($null -eq $State.CompletedUtc) { Complete-ScanState $State }
@@ -2768,7 +2792,7 @@ function Export-ScanReport {
         $json = $State | ConvertTo-Json -Depth 20
         [IO.File]::WriteAllText($jsonPath, $json, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($textPath, (Convert-ReportToText $State), [Text.UTF8Encoding]::new($false))
-        Write-Color "[REPORT] $jsonPath" Magenta; Write-Color "[REPORT] $textPath" Magenta
+        if (-not $Quiet) { Write-Color "[REPORT] $jsonPath" Magenta; Write-Color "[REPORT] $textPath" Magenta }
         return [pscustomobject]@{ Json=$jsonPath; Text=$textPath }
     } catch {
         Write-Color "[WARNING] The scan completed, but the report could not be exported: $($_.Exception.Message)" Yellow
@@ -2837,7 +2861,7 @@ function Invoke-ScanMode {
         $script:PhaseClock=$null
         Complete-ScanState $state
         Show-ScanComplete $state
-        Export-ScanReport $state | Out-Null
+        Export-ScanReport $state -Quiet:(-not $script:DetailedOutput) | Out-Null
         return $state
     } finally {
         $script:AnalysisProfile=$previousProfile
