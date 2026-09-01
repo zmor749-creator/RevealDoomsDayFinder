@@ -36,6 +36,7 @@ Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kul
 - Kaynak listesi fingerprint'i; entry içerik hash'lerinden isim/sıra/sıkıştırmadan bağımsız fingerprint; class adları normalize edilmiş yapısal fingerprint. Yapısal benzerlik tek başına `DETECTED` oluşturmaz; keyfi obfuscation'a dayanıklılık garantisi yoktur.
 - Java süreçleri, JVM agent/classpath argümanları, Minecraft ilişkili süreçlerin görülebilen yüklü modülleri.
 - Dosya ADS'leri; normal Zone.Identifier metadata olarak ele alınır. Adı Zone.Identifier olsa bile payload başlığı varsa içerik incelenir.
+- Windows PowerShell 5.1 uyumluluğu için ADS içerikleri FileSystem provider ile okunur; 64 MiB üstündeki tek stream eksik analiz olarak raporlanır. Diske payload kopyası çıkarılmaz.
 - Mevcut Sysmon XML olayları: process, loaded image, Java'ya process access/remote thread, stream, deletion ve process tampering. Sysmon kurulmaz, açılmaz veya yeniden yapılandırılmaz.
 - SysMain/Prefetch/sechost bütünlük bağlamı; PSReadLine ve olay kayıtları; USN ham candidate satırları; seçili registry/LNK ve dosya metadata kaynakları.
 - Bir Java hedefini, bellek yazma yeteneğini ve Oracle kullanım yolunu birlikte içeren dosyalarda `REVIEW` bağlamı. Dosyanın varlığı, çalıştırıldığını veya DoomsDay olduğunu kanıtlamaz.

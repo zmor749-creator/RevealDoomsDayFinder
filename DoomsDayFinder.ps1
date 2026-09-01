@@ -368,9 +368,31 @@ function Get-MagicInfoFromStream {
 
 function Get-MagicInfo {
     param([Parameter(Mandatory)][string]$LiteralPath)
-    $stream = [IO.File]::Open($LiteralPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    $stream = Open-ReadOnlyEvidenceStream $LiteralPath
     try { return Get-MagicInfoFromStream -Stream $stream -DisplayedExtension ([IO.Path]::GetExtension($LiteralPath)) }
     finally { $stream.Dispose() }
+}
+
+function Open-ReadOnlyEvidenceStream {
+    param([string]$LiteralPath)
+    $colon=$LiteralPath.IndexOf(':', [Math]::Min(2,$LiteralPath.Length))
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $colon -ge 2) {
+        $basePath=$LiteralPath.Substring(0,$colon); $streamName=$LiteralPath.Substring($colon+1)
+        $information=Get-Item -LiteralPath $basePath -Stream $streamName -ErrorAction Stop
+        if ([long]$information.Length -gt $script:Limits.MaximumNestedEntryBytes) { throw [IO.InvalidDataException]::new('ADS exceeds the 64 MiB in-memory provider safety budget.') }
+        $memory=[IO.MemoryStream]::new()
+        try {
+            if ($PSVersionTable.PSVersion.Major -ge 6) {
+                Get-Content -LiteralPath $basePath -Stream $streamName -AsByteStream -ReadCount 65536 -ErrorAction Stop | ForEach-Object { $chunk=[byte[]]$_; if ($memory.Length+$chunk.Length -gt $script:Limits.MaximumNestedEntryBytes) { throw 'ADS changed beyond safety budget.' }; $memory.Write($chunk,0,$chunk.Length) }
+            } else {
+                Get-Content -LiteralPath $basePath -Stream $streamName -Encoding Byte -ReadCount 65536 -ErrorAction Stop | ForEach-Object { $chunk=[byte[]]$_; if ($memory.Length+$chunk.Length -gt $script:Limits.MaximumNestedEntryBytes) { throw 'ADS changed beyond safety budget.' }; $memory.Write($chunk,0,$chunk.Length) }
+            }
+            if ($memory.Length -ne [long]$information.Length) { throw 'ADS length changed during read.' }
+            $memory.Position=0
+            return ,$memory
+        } catch { $memory.Dispose(); throw }
+    }
+    return [IO.File]::Open($LiteralPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
 }
 
 function Test-TextMatch {
@@ -837,7 +859,7 @@ function Confirm-FileFinding {
     Write-Stage 'VERIFY' 'Reopening candidate and reproducing hash plus signature matches...'
     $stream=$null
     try {
-        $stream=[IO.File]::Open($LiteralPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $stream=Open-ReadOnlyEvidenceStream $LiteralPath
         $secondHash=Get-StreamSha256 $stream
         if ($secondHash -ne $InitialFinding.SHA256) { throw 'SHA-256 changed between inspections.' }
         $magic=Get-MagicInfoFromStream $stream ''
@@ -1024,6 +1046,9 @@ function Get-MinecraftLocations {
     }
     if ($env:USERPROFILE) {
         $candidates += @(
+            (Join-Path $env:USERPROFILE '.lunarclient'),
+            (Join-Path $env:USERPROFILE '.feather'),
+            (Join-Path $env:USERPROFILE '.minecraft'),
             (Join-Path $env:USERPROFILE 'curseforge\minecraft'),
             (Join-Path $env:USERPROFILE 'Documents\Curse\Minecraft'),
             (Join-Path $env:USERPROFILE 'AppData\Roaming\ModrinthApp')
@@ -1360,7 +1385,12 @@ function Get-ZoneIdentifier {
     $result = [ordered]@{ ZoneId=$null; ReferrerUrl=''; HostUrl='' }
     try {
         $streamPath = "$HostPath`:$StreamName"
-        $text = [IO.File]::ReadAllText($streamPath)
+        $zoneStream=Open-ReadOnlyEvidenceStream $streamPath
+        try {
+            if ($zoneStream.Length -gt $script:Limits.MaximumMetadataBytes) { throw 'Zone metadata exceeds safe parse size.' }
+            $zoneReader=[IO.StreamReader]::new($zoneStream,[Text.Encoding]::UTF8,$true,4096,$true)
+            try { $text=$zoneReader.ReadToEnd() } finally { $zoneReader.Dispose() }
+        } finally { $zoneStream.Dispose() }
         foreach ($line in ($text -split "`r?`n")) {
             $parts = $line -split '=',2
             if ($parts.Count -ne 2) { continue }
@@ -1379,7 +1409,7 @@ function Inspect-AdsPayload {
     $streamName = [string]$StreamInfo.Stream
     $streamPath = "$HostPath`:$streamName"
     $hostFile = Get-Item -LiteralPath $HostPath -Force
-    $stream = [IO.File]::Open($streamPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    $stream = Open-ReadOnlyEvidenceStream $streamPath
     try {
         $magic = Get-MagicInfoFromStream -Stream $stream -DisplayedExtension ([IO.Path]::GetExtension($HostPath))
         $sha256 = Get-StreamSha256 $stream
@@ -1809,6 +1839,17 @@ function Invoke-QuickScan {
 function Get-DefaultAdsRoots {
     param([switch]$IncludeAppData)
     $roots = [System.Collections.ArrayList]::new()
+    foreach ($knownFolder in @([Environment]::GetFolderPath('DesktopDirectory'),[Environment]::GetFolderPath('MyDocuments'))) {
+        if ($knownFolder -and (Test-Path -LiteralPath $knownFolder -PathType Container)) { [void]$roots.Add($knownFolder) }
+    }
+    try {
+        $shellFolders=Get-ItemProperty -LiteralPath 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop
+        $downloadsId='{374DE290-123F-4565-9164-39C4925E467B}'
+        if ($shellFolders.PSObject.Properties[$downloadsId]) {
+            $downloadsPath=[Environment]::ExpandEnvironmentVariables([string]$shellFolders.$downloadsId)
+            if (Test-Path -LiteralPath $downloadsPath -PathType Container) { [void]$roots.Add($downloadsPath) }
+        }
+    } catch { }
     if ($env:USERPROFILE) {
         foreach ($name in @('Desktop','Downloads','Documents')) {
             $path = Join-Path $env:USERPROFILE $name

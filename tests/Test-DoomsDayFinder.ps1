@@ -99,7 +99,8 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     Test-Case 'NTFS ADS payload independently verified' {
         Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $plain)))
         $hostPath=Join-Path $testDirectory 'notes.txt'; [IO.File]::WriteAllText($hostPath,'benign fixture')
-        [IO.File]::WriteAllBytes(($hostPath+':payload'),[IO.File]::ReadAllBytes($plain))
+        if ($PSVersionTable.PSVersion.Major -ge 6) { Set-Content -LiteralPath $hostPath -Stream payload -AsByteStream -Value ([IO.File]::ReadAllBytes($plain)) }
+        else { Set-Content -LiteralPath $hostPath -Stream payload -Encoding Byte -Value ([IO.File]::ReadAllBytes($plain)) }
         $info=Get-Item -LiteralPath $hostPath -Stream payload
         $s=New-ScanState ADS; $f=Inspect-AdsPayload $hostPath $info $s
         Assert-True ($f.Verdict -eq 'DETECTED' -and $f.VerificationStatus -eq 'VERIFIED' -and $f.Path -eq ($hostPath+':payload'))
@@ -107,7 +108,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     Test-Case 'Normal Zone.Identifier is not a family finding' {
         Set-TestDatabase
         $hostPath=Join-Path $testDirectory 'download.txt'; [IO.File]::WriteAllText($hostPath,'benign fixture')
-        [IO.File]::WriteAllText(($hostPath+':Zone.Identifier'),"[ZoneTransfer]`r`nZoneId=3`r`nHostUrl=https://example.invalid/file")
+        Set-Content -LiteralPath $hostPath -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`nHostUrl=https://example.invalid/file"
         $z=Get-ZoneIdentifier $hostPath; Assert-True ($z.ZoneId -eq 3 -and $z.HostUrl -eq 'https://example.invalid/file')
     }
 } else {
