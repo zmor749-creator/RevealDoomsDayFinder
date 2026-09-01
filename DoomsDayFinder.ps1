@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.2.0'
+$script:ToolVersion = '1.2.1'
 $script:ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:SignaturePath = Join-Path $script:ProjectRoot 'signatures\doomsday.json'
 $script:ReportDirectory = Join-Path $script:ProjectRoot 'Reports'
@@ -41,6 +41,7 @@ $script:ProgressWidth = 0
 $script:ProgressLastUpdate = [DateTime]::MinValue
 $script:ProgressCurrent = 0
 $script:ProgressTotal = 0
+$script:ConsoleNativeApi = $null
 $script:Limits = [ordered]@{
     MaximumRecursion = 3
     MaximumDecompressedBytes = 536870912L
@@ -123,6 +124,13 @@ function Show-RevealBanner {
     Write-Host $banner -ForegroundColor Magenta
 }
 
+function Format-ScanProgressLine {
+    param([string]$Status, [int]$Current, [int]$Total)
+    if ($Total -le 0) { return ('[INDEX] {0:N0} files | {1}' -f $Current,$Status) }
+    $percent = [Math]::Min(100, [Math]::Floor(($Current * 100.0) / $Total))
+    return ('[SCAN] {0:N0} / {1:N0} | {2}% | {3}' -f $Current,$Total,$percent,$Status)
+}
+
 function Write-ScanProgress {
     param(
         [string]$Activity,
@@ -133,17 +141,79 @@ function Write-ScanProgress {
     )
     if ($Completed) {
         if ($script:ProgressWidth -gt 0) { Write-Host ("`r" + (' ' * $script:ProgressWidth) + "`r") -NoNewline; $script:ProgressWidth=0 }
+        $script:ProgressLastUpdate=[DateTime]::MinValue
         return
     }
-    if (($Current -lt $Total) -and (([DateTime]::UtcNow-$script:ProgressLastUpdate).TotalMilliseconds -lt 150)) { return }
+    $finalUpdate = $Total -gt 0 -and $Current -ge $Total
+    if (-not $finalUpdate -and (([DateTime]::UtcNow-$script:ProgressLastUpdate).TotalMilliseconds -lt 150)) { return }
     $script:ProgressLastUpdate=[DateTime]::UtcNow
-    $percent = if ($Total -gt 0) { [Math]::Min(100, [Math]::Floor(($Current * 100.0) / $Total)) } else { 0 }
-    $line = '[SCAN] {0:N0} / {1:N0} | {2}% | {3}' -f $Current,$Total,$percent,$Status
+    $line = Format-ScanProgressLine -Status $Status -Current $Current -Total $Total
     $width=100
     try { if ($Host.UI.RawUI.WindowSize.Width -gt 10) { $width=$Host.UI.RawUI.WindowSize.Width-1 } } catch { }
     if ($line.Length -gt $width) { $line=$line.Substring(0,$width) }
     Write-Host ("`r" + $line.PadRight([Math]::Min($width,[Math]::Max($script:ProgressWidth,$line.Length)))) -NoNewline -ForegroundColor Magenta
     $script:ProgressWidth=$line.Length
+}
+
+function Get-ScanConsoleMode {
+    param([uint32]$OriginalMode)
+    # Preserve CTRL+C, line input and all other flags. Only disable QuickEdit.
+    return [uint32](($OriginalMode -bor [uint32]0x80) -band ([uint32]::MaxValue -bxor [uint32]0x40))
+}
+
+function Get-ConsoleNativeApi {
+    if ($null -ne $script:ConsoleNativeApi) { return $script:ConsoleNativeApi }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $null }
+    # Bind three documented Windows console APIs in memory using PowerShell/.NET.
+    # No C# source, compiler, downloaded code, registry writes or payload execution.
+    $name=[Reflection.AssemblyName]::new('RevealConsole_'+[guid]::NewGuid().ToString('N'))
+    $assembly=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name,[Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module=$assembly.DefineDynamicModule($name.Name)
+    $type=$module.DefineType('RevealConsoleApi',([Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed))
+    $attributes=[Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
+    $library=Join-Path ([Environment]::SystemDirectory) 'kernel32.dll'
+    $definitions=@(
+        @{ Name='GetStdHandle'; Return=[IntPtr]; Parameters=[Type[]]@([int]) },
+        @{ Name='GetConsoleMode'; Return=[int]; Parameters=[Type[]]@([IntPtr],[uint32].MakeByRefType()) },
+        @{ Name='SetConsoleMode'; Return=[int]; Parameters=[Type[]]@([IntPtr],[uint32]) }
+    )
+    foreach ($definition in $definitions) {
+        $method=$type.DefinePInvokeMethod($definition.Name,$library,$definition.Name,$attributes,
+            [Reflection.CallingConventions]::Standard,$definition.Return,$definition.Parameters,
+            [Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Ansi)
+        $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    $script:ConsoleNativeApi=$type.CreateType()
+    return $script:ConsoleNativeApi
+}
+
+function Enter-ScanConsoleMode {
+    $guard=[pscustomobject]@{ Changed=$false; OriginalMode=[uint32]0; Handle=[IntPtr]::Zero; Api=$null; Warning='' }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $guard }
+    try {
+        $api=Get-ConsoleNativeApi
+        $handle=$api::GetStdHandle(-10)
+        [uint32]$original=0
+        # Redirected stdin, ISE and non-console hosts may not expose a console.
+        if ($api::GetConsoleMode($handle,[ref]$original) -eq 0) { return $guard }
+        $scanMode=Get-ScanConsoleMode $original
+        if ($scanMode -eq $original) { return $guard }
+        if ($api::SetConsoleMode($handle,$scanMode) -eq 0) { throw 'Console mode change was not accepted.' }
+        $guard.OriginalMode=$original; $guard.Handle=$handle; $guard.Api=$api; $guard.Changed=$true
+    } catch {
+        $guard.Warning='QuickEdit protection unavailable. If text selection pauses this console, press Esc to resume. '+$_.Exception.Message
+    }
+    return $guard
+}
+
+function Exit-ScanConsoleMode {
+    param($Guard)
+    if ($null -eq $Guard -or -not $Guard.Changed) { return }
+    try {
+        $api=$Guard.Api
+        if ($api::SetConsoleMode($Guard.Handle,$Guard.OriginalMode) -eq 0) { throw 'Console mode restoration was not accepted.' }
+        $Guard.Changed=$false
+    } catch { Write-Color ('[WARNING] Could not restore console selection mode: '+$_.Exception.Message) Yellow }
 }
 
 function ConvertTo-SafeDateString {
@@ -1068,17 +1138,17 @@ function Get-ReadOnlyFiles {
     foreach ($root in @(Get-NormalizedScanRoots $Roots)) { $pending.Push($root) }
     while ($pending.Count -gt 0) {
         $directory=$pending.Pop()
-        try { $children=@(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) }
-        catch { $State.FilesSkipped++; Add-ScanWarning $State 'DISCOVERY' $_.Exception.Message $directory; continue }
-        foreach ($child in $children) {
-            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $State.FilesSkipped++
-                Add-ScanWarning $State 'DISCOVERY' 'Reparse point not followed; include its target explicitly if authorized.' $child.FullName
-                continue
+        try {
+            Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop | ForEach-Object {
+                $child=$_
+                if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $State.FilesSkipped++
+                    Add-ScanWarning $State 'DISCOVERY' 'Reparse point not followed; include its target explicitly if authorized.' $child.FullName
+                } elseif ($child.PSIsContainer) {
+                    if ($Recurse) { $pending.Push($child.FullName) }
+                } else { $child }
             }
-            if ($child.PSIsContainer) { if ($Recurse) { $pending.Push($child.FullName) } }
-            else { $child }
-        }
+        } catch { $State.FilesSkipped++; Add-ScanWarning $State 'DISCOVERY' $_.Exception.Message $directory }
     }
 }
 
@@ -1087,7 +1157,9 @@ function Get-CandidateFiles {
     $extensions=@('.jar','.zip','.exe','.dll','.class','.dat','.tmp','.bin','.ps1','.bat','.cmd','.vbs','.py')
     $files=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     Write-Stage 'COLLECT' 'Indexing files and checking magic bytes. The total is shown when enumeration finishes.'
-    foreach ($file in Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse) {
+    Write-ScanProgress -Activity 'Collect' -Status 'Finding candidates; total pending' -Current 0 -Total 0
+    Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse | ForEach-Object {
+        $file=$_
         $State.DiscoveredFiles++
         $candidate=$file.Extension.ToLowerInvariant() -in $extensions
         if (-not $candidate) {
@@ -1095,7 +1167,7 @@ function Get-CandidateFiles {
             catch { $State.FilesSkipped++; Add-ScanWarning $State 'MAGIC' $_.Exception.Message $file.FullName }
         }
         if ($candidate) { [void]$files.Add($file.FullName) }
-        Write-ScanProgress -Activity 'Collect' -Status 'Indexing files; total pending' -Current $State.DiscoveredFiles -Total 0
+        Write-ScanProgress -Activity 'Collect' -Status ('Candidates: {0:N0}; counting' -f $files.Count) -Current $State.DiscoveredFiles -Total 0
     }
     Write-ScanProgress -Completed
     return @($files | Sort-Object)
@@ -1456,7 +1528,12 @@ function Invoke-AdsScan {
     param([string[]]$Roots, $State, [switch]$DeepScan)
     Write-Stage 'ADS' 'Enumerating NTFS alternate data streams (read-only)...'
     $files = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($file in Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse:$DeepScan) { [void]$files.Add($file.FullName) }
+    Write-ScanProgress -Activity 'ADS' -Status 'Finding ADS hosts; total pending' -Current 0 -Total 0
+    Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse:$DeepScan | ForEach-Object {
+        [void]$files.Add($_.FullName)
+        Write-ScanProgress -Activity 'ADS' -Status 'Finding ADS hosts; counting' -Current $files.Count -Total 0
+    }
+    Write-ScanProgress -Completed
     $adsErrors=0
     $fileList = @($files | Sort-Object)
     if ($fileList.Count -gt 0) { Write-Stage 'ADS' ("Checking ADS on {0:N0} files with one-line progress." -f $fileList.Count) }
@@ -2126,26 +2203,34 @@ function Invoke-ScanMode {
     param([string]$SelectedMode, [string]$SelectedPath = '', [switch]$DeepAds)
     $script:InspectionCache = @{}
     $script:HashCache = @{}
-    $state = New-ScanState $SelectedMode
-    if (-not $state.IsAdministrator) { Write-Color '[LIMITED MODE] Administrator-only forensic sources will be skipped.' Yellow }
-    switch ($SelectedMode) {
-        'Quick' { Invoke-QuickScan $state }
-        'Full' { Invoke-FullScan $state }
-        'File' {
-            if (-not $SelectedPath) { throw 'A file path is required.' }
-            Write-Section 'FILE SCAN'; Invoke-FileInspection -LiteralPath $SelectedPath -State $state -AlwaysRecord | Out-Null
+    $script:ProgressLastUpdate = [DateTime]::MinValue
+    $consoleGuard = Enter-ScanConsoleMode
+    try {
+        $state = New-ScanState $SelectedMode
+        if ($consoleGuard.Warning) { Add-ScanWarning $state 'CONSOLE' $consoleGuard.Warning }
+        if (-not $state.IsAdministrator) { Write-Color '[LIMITED MODE] Administrator-only forensic sources will be skipped.' Yellow }
+        switch ($SelectedMode) {
+            'Quick' { Invoke-QuickScan $state }
+            'Full' { Invoke-FullScan $state }
+            'File' {
+                if (-not $SelectedPath) { throw 'A file path is required.' }
+                Write-Section 'FILE SCAN'; Invoke-FileInspection -LiteralPath $SelectedPath -State $state -AlwaysRecord | Out-Null
+            }
+            'ADS' {
+                Write-Section 'DEEP ADS SCAN'; $roots = if ($SelectedPath) { @($SelectedPath) } else { Get-DefaultAdsRoots -IncludeAppData }
+                Invoke-AdsScan -Roots $roots -State $state -DeepScan
+            }
+            'Runtime' { Write-Section 'RUNTIME SCAN'; Invoke-RuntimeScan $state }
+            default { throw "Unsupported scan mode: $SelectedMode" }
         }
-        'ADS' {
-            Write-Section 'DEEP ADS SCAN'; $roots = if ($SelectedPath) { @($SelectedPath) } else { Get-DefaultAdsRoots -IncludeAppData }
-            Invoke-AdsScan -Roots $roots -State $state -DeepScan
-        }
-        'Runtime' { Write-Section 'RUNTIME SCAN'; Invoke-RuntimeScan $state }
-        default { throw "Unsupported scan mode: $SelectedMode" }
+        Complete-ScanState $state
+        Show-ScanComplete $state
+        Export-ScanReport $state | Out-Null
+        return $state
+    } finally {
+        try { Write-ScanProgress -Completed }
+        finally { Exit-ScanConsoleMode $consoleGuard }
     }
-    Complete-ScanState $state
-    Show-ScanComplete $state
-    Export-ScanReport $state | Out-Null
-    return $state
 }
 
 function Show-MainMenu {

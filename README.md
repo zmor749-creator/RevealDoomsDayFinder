@@ -1,6 +1,6 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.2.0.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.2.1.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
@@ -43,6 +43,14 @@ Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kul
 
 Full kapsamı hız için daraltılmaz. Tekrar okumalar cache ile azaltılır; bağımsız VERIFY aşaması cache kullanmaz. Konsolda dosyalar alt alta yazılmaz: taranacak candidate toplamı ve güncellenen tek satır gösterilir. Süre dosya sayısına, boyutlarına, diske ve erişim izinlerine bağlıdır. Güvenlik limitleri 512 MiB toplam expanded bytes, 200.000 toplam entry, 1000:1 oran, 64 MiB tek embedded/class buffer ve 4 MiB metadata'dır. Limit nedeniyle tamamlanamayan analiz açıkça bildirilir. Ctrl+C taramayı keser; kesintiden sonra tamamlanmış rapor garantisi verilmez.
 
+### Tek satır ilerleme ve Enter sorunu
+
+1.2.1'de keşif çıktısı tüm dizin ağacını bellekte bekletmeden dosya dosya işlenir. Sayım sırasında `[INDEX] 16,182 files | Candidates: 120; counting` görünür; henüz bilinmeyen toplam yerine `/ 0` veya `%0` yazılmaz. İçerik incelemesi başlayınca gerçek toplam ve yüzde gösterilir. Mor satır yerinde güncellenir; bilinmeyen toplam aşamasında da ekran yazımı en fazla yaklaşık 150 ms'de bir yapılır. Sonuçlar ve uyarılar ayrı satırlardır. Disk/izin işlemi gerçekten bekliyorsa arayüz bağımsız bir ilerleme yüzdesi uydurmaz.
+
+Taramanın içinde `Read-Host`, tuş veya Enter beklemesi yoktur. Eski Windows konsolundaki fareyle seçim duraklamasına karşı, yalnızca tarama boyunca QuickEdit kapatılır ve `finally` içinde önceki konsol modu geri yüklenir. Bu işlem PowerShell/.NET Reflection.Emit ile yalnızca `GetStdHandle`, `GetConsoleMode`, `SetConsoleMode` API'lerini bağlar; C# derlemez, kayıt defterine yazmaz ve CTRL+C davranışını korur. Konsol bulunmayan host'larda uygulanmaz; politika veya API hatasında uyarı verilir. Zorla süreç kapatılırsa geri yükleme garantisi yoktur. Menüdeki kullanıcı seçimi ve tarama sonrası menüye dönme istemi ayrı davranışlardır; `-Mode Full` bunları kullanmaz.
+
+İlgili Windows davranışı: [SetConsoleMode](https://learn.microsoft.com/en-us/windows/console/setconsolemode), [konsol modunu geri yükleme](https://learn.microsoft.com/en-us/windows/console/console-modes). Eski sürüm zaten metin seçimiyle duraklatılmışsa önce Esc, ardından Ctrl+C ile durdurup yeni sürümü çalıştırın.
+
 ## İmzalar ve kararlar
 
 `signatures/doomsday.json` ve tek dosya kullanımındaki gömülü veri, kaynak bağlantısı belirtilen **üç doğrulanmamış topluluk byte pattern'i** içerir. Bunlar `Verified=false` olarak işaretlidir ve örtüşen pattern'ler aynı bağımsızlık grubundadır. Hiçbiri `DETECTED` yetkisi vermez. Güncelleme yalnızca JSON indirir. Bakımcı onayı, JSON alanını `true` yapmakla bilimsel olarak sağlanmış olmaz: gerçek örnek analizi ve temiz corpus testi gerekir.
@@ -61,7 +69,7 @@ Silinmiş payload byte'ları otomatik kurtarılmaz. Mevcut Sysmon deletion kayd�
 
 Sonuçlar konsola, JSON ve TXT raporları scriptin yanındaki `Reports` klasörüne yazılır. Yazılamazsa belirtilen kullanıcı klasörüne geçilir. Raporlar tam yollar, komutlar, kullanıcı bilgileri ve URL'ler içerebilir; herkese açık Discord/GitHub'a yüklemeyin. İnceleme, cihaz sahibinin bilgisi ve izniyle yapılmalıdır.
 
-“Read-only”, incelenen dosyaları, ADS'leri, registry'yi, servisleri ve logları değiştirmemeyi ifade eder. Rapor oluşturma ve kullanıcının başlattığı imza güncellemesi araç dosyalarına yazar. Windows çalıştırma/erişim izleri oluşturabilir; fiziksel olarak sıfır disk yazımı iddia edilmez.
+“Read-only”, incelenen dosyaları, ADS'leri, registry'yi, servisleri ve logları değiştirmemeyi ifade eder. Rapor oluşturma ve kullanıcının başlattığı imza güncellemesi araç dosyalarına yazar; geçici konsol seçim modu yalnızca arayüz içindir. Windows çalıştırma/erişim izleri oluşturabilir; fiziksel olarak sıfır disk yazımı iddia edilmez.
 
 ## Testler ve sınırlamalar
 

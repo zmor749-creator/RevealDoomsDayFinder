@@ -62,6 +62,69 @@ function Inspect-TestFile {
 Set-TestDatabase
 $plain=New-TestArchive 'clean.jar' 1 @{ 'fixture/resource.txt'=[Text.Encoding]::UTF8.GetBytes('fixture-only-marker-7fe56cd1') }
 Test-Case 'Core self-test' { Assert-True (Invoke-BuiltInSelfTest) }
+Test-Case 'Unknown total never displays division by zero or fake percentage' {
+    $line=Format-ScanProgressLine -Status 'Candidates: 120; counting' -Current 16182 -Total 0
+    Assert-True ($line -like '[[]INDEX]*' -and $line -notmatch '/\s*0|%' -and $line -match 'Candidates: 120')
+}
+Test-Case 'Known total displays genuine scan progress' {
+    $line=Format-ScanProgressLine -Status 'Detailed file inspection' -Current 7 -Total 10
+    Assert-True ($line -eq '[SCAN] 7 / 10 | 70% | Detailed file inspection')
+}
+Test-Case 'Unknown-total updates are throttled too' {
+    $script:ProgressLastUpdate=[DateTime]::UtcNow.AddMinutes(1)
+    try {
+        $output=@(Write-ScanProgress -Current 16182 -Total 0 -Status 'Counting' 6>&1)
+        Assert-True ($output.Count -eq 0)
+    } finally { Write-ScanProgress -Completed }
+}
+Test-Case 'Final known-total update bypasses throttle and remains one line' {
+    $script:ProgressLastUpdate=[DateTime]::UtcNow.AddMinutes(1)
+    try {
+        $output=@(Write-ScanProgress -Current 10 -Total 10 -Status 'Done' 6>&1)
+        Assert-True ($output.Count -eq 1 -and $output[0].ToString() -match '100%' -and $output[0].ToString() -notmatch "`n")
+    } finally { Write-ScanProgress -Completed }
+}
+Test-Case 'Candidate discovery consumes each file before requesting the next' {
+    Set-TestDatabase
+    function Get-ReadOnlyFiles {
+        param([string[]]$Roots,$State,[switch]$Recurse)
+        Get-Item -LiteralPath $plain
+        Assert-True ($State.DiscoveredFiles -eq 1) 'Discovery buffered output instead of streaming it.'
+        Get-Item -LiteralPath $plain
+    }
+    $s=New-ScanState Full
+    $result=@(Get-CandidateFiles -Roots @($testDirectory) -State $s -Full)
+    Assert-True ($s.DiscoveredFiles -eq 2 -and $result.Count -eq 1 -and $result[0] -eq $plain)
+}
+Test-Case 'Directory traversal is streamed and retains recursive coverage' {
+    Set-TestDatabase
+    $root=Join-Path $testDirectory 'discovery'
+    $sub=Join-Path $root 'nested'; [void][IO.Directory]::CreateDirectory($sub)
+    [IO.File]::WriteAllText((Join-Path $root 'first.txt'),'plain')
+    [IO.File]::Copy($plain,(Join-Path $sub 'renamed.png'))
+    $s=New-ScanState Full
+    $all=@(Get-ReadOnlyFiles -Roots @($root) -State $s -Recurse)
+    Assert-True ($all.Count -eq 2 -and $s.FilesSkipped -eq 0)
+    $candidates=@(Get-CandidateFiles -Roots @($root) -State $s -Full)
+    Assert-True ($s.DiscoveredFiles -eq 2 -and $candidates.Count -eq 1 -and $candidates[0] -like '*renamed.png')
+}
+Test-Case 'QuickEdit mask preserves all other input flags including CTRL+C' {
+    foreach ($mode in @([uint32]0,[uint32]0x47,[uint32]0x1F7,[uint32]::MaxValue)) {
+        $changed=Get-ScanConsoleMode $mode
+        Assert-True (($changed -band 0x40) -eq 0 -and ($changed -band 0x80) -ne 0)
+        Assert-True (($changed -band ([uint32]::MaxValue -bxor [uint32]0xC0)) -eq ($mode -band ([uint32]::MaxValue -bxor [uint32]0xC0)))
+    }
+}
+Test-Case 'Console cleanup runs when a scan fails' {
+    Set-TestDatabase
+    $script:ConsoleCleanupTest=0
+    function Enter-ScanConsoleMode { [pscustomobject]@{ Warning='' } }
+    function Exit-ScanConsoleMode { param($Guard); $script:ConsoleCleanupTest++ }
+    function Invoke-QuickScan { param($State); throw 'Expected fixture scan failure' }
+    $failed=$false
+    try { Invoke-ScanMode Quick | Out-Null } catch { $failed=$_.Exception.Message -eq 'Expected fixture scan failure' }
+    Assert-True ($failed -and $script:ConsoleCleanupTest -eq 1)
+}
 Test-Case 'Empty source lists do not become null' { $s=New-ScanState File; Add-SourceStatus $s A $true; Add-SourceStatus $s B $false; Assert-True ($s.AnalyzedSources.Count -eq 1 -and $s.UnavailableSources.Count -eq 1) }
 Test-Case 'No-signature clean JAR' { Set-TestDatabase; $r=Inspect-TestFile $plain; Assert-True ($r.Finding.Verdict -eq 'INFO' -and $r.State.FilesFullyScanned -eq 1) }
 Test-Case 'Class binary parser' { $c=Read-JavaClassIndex (Get-TestClassBytes); Assert-True ($c.Name -eq 'fixture/Example' -and 'java/lang/Object' -in $c.References) }
@@ -96,6 +159,14 @@ Test-Case 'No basename-only evidence correlation' { Set-TestDatabase; $s=New-Sca
 Test-Case 'Exact-path context does not upgrade verdict' { Set-TestDatabase; $s=New-ScanState Full; $f=New-Finding -CurrentName 'client.jar' -FullPath 'C:\A\client.jar'; [void]$s.Findings.Add($f); [void]$s.Evidence.Add([pscustomobject]@{ Source='Test'; Path='C:\A\client.jar' }); Invoke-EvidenceCorrelation $s; Assert-True ($f.Evidence.Count -eq 1 -and $f.Verdict -eq 'INFO') }
 Test-Case 'Distributed database contains no invented verified signatures' { Import-DoomsDaySignatures | Out-Null; $s=New-ScanState File; Assert-True ($s.SignatureCount -eq 3 -and $s.VerifiedSignatureCount -eq 0) }
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    Test-Case 'Pure PowerShell console API bindings work on this runtime' {
+        $api=Get-ConsoleNativeApi
+        Assert-True ($null -ne $api.GetMethod('GetStdHandle') -and $null -ne $api.GetMethod('SetConsoleMode'))
+        $guard=Enter-ScanConsoleMode
+        try { Assert-True ([string]::IsNullOrEmpty($guard.Warning)) $guard.Warning }
+        finally { Exit-ScanConsoleMode $guard }
+        Assert-True (-not $guard.Changed)
+    }
     Test-Case 'NTFS ADS payload independently verified' {
         Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $plain)))
         $hostPath=Join-Path $testDirectory 'notes.txt'; [IO.File]::WriteAllText($hostPath,'benign fixture')
