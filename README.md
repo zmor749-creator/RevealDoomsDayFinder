@@ -1,6 +1,6 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.2.2.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.3.0.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
@@ -26,6 +26,21 @@ Bu, önceden indirdiğiniz yerel scripti çalıştırır; internetten kod indiri
 ```
 
 Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kullanıcının Desktop, Downloads, Documents, Temp, LocalAppData ve Roaming dizinlerini inceler. Tüm diskler veya tüm kullanıcı hesapları otomatik taranmaz. Özel kurulumlar için File/ADS modunda açık yol verin. Menüden tekrar tekrar tarama yapılabilir; komut satırı modu sonuçları yazıp çağıran PowerShell'e döner.
+
+### 1.3.0 paralel dosya ve ADS analizi
+
+```powershell
+.\DoomsDayFinder.ps1 -Mode Full -Workers 4
+```
+
+- Quick/Full dosya içerikleri ve ADS host dosyaları runspace havuzuyla eşzamanlı incelenir. Varsayılan işçi sayısı mantıksal işlemci sayısı ile 4'ün küçüğüdür; `-Workers 1` seri çalışma, 2–8 kontrollü paralellik seçer. Tek dosyalık File modunda arşivin içi ayrıca paralelleştirilmez.
+- İşçiler aynı tarama motorunu kullanır; tüm class/entry byte'ları, nested arşivler, hash'ler, limitler, temiz hash çelişkisi ve bağımsız VERIFY korunur. Her işçinin imza snapshot'ı ve çalışma cache'i ayrıdır. İmza JSON'u ve dosya yolları kod olarak yorumlanmaz.
+- Yalnızca ana iş parçacığı rapor sayaçlarını, bulguları ve mor konsol satırını birleştirir. `Active: 4/4`, dört dosyanın aynı anda incelendiğini gösterir. Tamamlanan ve aktif dosyalar karıştırılmaz.
+- İşçi sayısı ve sonuç kuyruğu sınırlıdır (en fazla işçi sayısının iki katı bekleyen sonuç). Binlerce PowerShell süreci açılmaz. Class cache bütçesi işçi başınadır; paralellik toplam RAM/disk yükünü artırabilir.
+- Ctrl+C sırasında tüm işçilere iptal gönderilir, runspace havuzu kapatılır. İçerik blokları ve arşiv/class döngüleri iptali kontrol eder; engellenmiş işletim sistemi I/O çağrısı hemen dönmeyebilir. İptal veya işçi başlatma hatası tamamlanmış/temiz sonuç olarak gösterilmez. Ayrı kalıcı arka plan süreçleri oluşturulmaz.
+- İlk dizin keşfi ve USN, registry, olay kayıtları gibi diğer forensic collector aşamaları hâlâ sırayladır. Tüm aşamaların aynı anda çalıştığı iddia edilmez. Özellikle yavaş disk ve çok büyük kaynaklarda 10–15 dakika garantisi yoktur; hiçbir dosya zaman kazanmak için sessizce atlanmaz.
+
+Regresyon testleri dört işçinin gerçekten zaman bakımından örtüşerek çalışmasını; seri/paralel hash, verdict ve 1847-class sonuçlarının eşitliğini; iptal/başlatma hatasında havuzun kapanmasını; ADS metadata ve doğrulanmış payload'ların korunmasını kontrol eder. Windows'ta iki PowerShell sürümünde test edilir. [Microsoft runspace havuzu modeli](https://learn.microsoft.com/en-us/powershell/scripting/developer/hosting/creating-multiple-runspaces).
 
 ## Tarama kapsamı
 
@@ -102,6 +117,6 @@ Sentetik fixture'lar çalıştırılmaz. Testler ayrı geçici dizinde üretilir
 
 Henüz ölçülmeyenler: gerçek DoomsDay buildleri, bypass'lı örnekler ve OptiFine/Sodium/Lithium/Fabric API/Forge/NeoForge/Iris gibi temiz mod corpus'unda tespit oranı. Doğrulanmış özgün örnekler, kaynak URL/hash ve etiketli temiz corpus olmadan üretim güvenilirliği iddiası yapılmaz.
 
-Tam olarak desteklenmeyenler: RAM içeriği/manual-map/kernel görünürlüğü, şifrelenmiş payload açma, PE içindeki arbitrary embedded container carving, sıkıştırılmış Prefetch içeriği, SQLite download tabloları, SRUM/Amcache/ShimCache kayıt parsing, FRN tabanlı USN rename zinciri, Jump List binary parsing, silinen içeriğin kurtarılması, runspace paralelleştirmesi ve eksiksiz forensic timeline. Bunların metadata'sı bazı collector'larda bulunabilir; tam çözümleme değildir. Windows PowerShell 5.1 dizin ADS'lerini bu provider ile enumerate edemez. Loglar varsayılan olarak son 30 gün ile sınırlıdır. Erişilemeyen kaynaklar, reparse noktaları ve parse limitleri raporlanır. PE magic, tam PE doğrulaması veya yürütülebilirlik ispatı değildir.
+Tam olarak desteklenmeyenler: RAM içeriği/manual-map/kernel görünürlüğü, şifrelenmiş payload açma, PE içindeki arbitrary embedded container carving, sıkıştırılmış Prefetch içeriği, SQLite download tabloları, SRUM/Amcache/ShimCache kayıt parsing, FRN tabanlı USN rename zinciri, Jump List binary parsing, silinen içeriğin kurtarılması ve eksiksiz forensic timeline. Bunların metadata'sı bazı collector'larda bulunabilir; tam çözümleme değildir. Windows PowerShell 5.1 dizin ADS'lerini bu provider ile enumerate edemez. Loglar varsayılan olarak son 30 gün ile sınırlıdır. Erişilemeyen kaynaklar, reparse noktaları ve parse limitleri raporlanır. PE magic, tam PE doğrulaması veya yürütülebilirlik ispatı değildir.
 
 Araştırma ve doğrulama politikası: [docs/RESEARCH.md](docs/RESEARCH.md).

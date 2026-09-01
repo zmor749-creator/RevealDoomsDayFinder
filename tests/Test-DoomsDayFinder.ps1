@@ -221,6 +221,73 @@ Test-Case 'XML external entities prohibited' { $blocked=$false; try { Get-EventX
 Test-Case 'No basename-only evidence correlation' { Set-TestDatabase; $s=New-ScanState Full; $f=New-Finding -CurrentName 'client.jar' -FullPath 'C:\A\client.jar'; [void]$s.Findings.Add($f); [void]$s.Evidence.Add([pscustomobject]@{ Source='Test'; Path='C:\B\client.jar' }); Invoke-EvidenceCorrelation $s; Assert-True ($f.Evidence.Count -eq 0) }
 Test-Case 'Exact-path context does not upgrade verdict' { Set-TestDatabase; $s=New-ScanState Full; $f=New-Finding -CurrentName 'client.jar' -FullPath 'C:\A\client.jar'; [void]$s.Findings.Add($f); [void]$s.Evidence.Add([pscustomobject]@{ Source='Test'; Path='C:\A\client.jar' }); Invoke-EvidenceCorrelation $s; Assert-True ($f.Evidence.Count -eq 1 -and $f.Verdict -eq 'INFO') }
 Test-Case 'Distributed database contains no invented verified signatures' { Import-DoomsDaySignatures | Out-Null; $s=New-ScanState File; Assert-True ($s.SignatureCount -eq 3 -and $s.VerifiedSignatureCount -eq 0) }
+Test-Case 'Parallel workers preserve serial findings, hashes and full class coverage' {
+    Set-TestDatabase
+    $files=@()
+    for ($n=0;$n -lt 6;$n++) {
+        $copy=Join-Path $testDirectory "parallel-$n.jar"
+        [IO.File]::Copy((Join-Path $testDirectory 'large.jar'),$copy); $files+=$copy
+    }
+    $serial=New-ScanState File
+    foreach ($file in $files) { Invoke-FileInspection -LiteralPath $file -State $serial -AlwaysRecord -QuietProgress | Out-Null }
+    $parallel=New-ScanState File
+    $before=@(Get-Runspace).Count
+    Invoke-ParallelInspection -Files $files -State $parallel -WorkerLimit 4 -AlwaysRecord -CaptureDiagnostics | Out-Null
+    Assert-True ($parallel.CandidateFiles -eq 6 -and $parallel.FilesFullyScanned -eq 6 -and $parallel.CorruptedUnreadable -eq 0)
+    Assert-True ($parallel.Performance.ParallelJobs -eq 6 -and $parallel.Performance.Workers -eq 4 -and @(Get-Runspace).Count -eq $before)
+    foreach ($finding in $parallel.Findings) {
+        $reference=@($serial.Findings | Where-Object Path -eq $finding.Path)[0]
+        Assert-True ($finding.SHA256 -eq $reference.SHA256 -and $finding.Verdict -eq $reference.Verdict -and $finding.ArchiveAnalysis.ClassesAnalyzed -eq 1847 -and $finding.ArchiveAnalysis.ClassShapeFingerprint -eq $reference.ArchiveAnalysis.ClassShapeFingerprint)
+    }
+    $overlap=$false
+    foreach ($a in $parallel.Performance.WorkerDiagnostics) {
+        foreach ($b in $parallel.Performance.WorkerDiagnostics) {
+            if ($a.WorkerId -ne $b.WorkerId -and $a.StartedUtc -lt $b.FinishedUtc -and $b.StartedUtc -lt $a.FinishedUtc) { $overlap=$true }
+        }
+    }
+    Assert-True $overlap 'No actual overlapping worker execution was observed.'
+}
+Test-Case 'Parallel verified detections retain independent verification and errors' {
+    Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $plain)))
+    $s=New-ScanState File
+    $files=@($plain,(Join-Path $testDirectory 'performance.jar'),(Join-Path $testDirectory 'wallpaper.png'),(Join-Path $testDirectory 'corrupt.jar'),(Join-Path $testDirectory 'missing-parallel.jar'))
+    Invoke-ParallelInspection -Files $files -State $s -WorkerLimit 2 -AlwaysRecord | Out-Null
+    Assert-True ($s.CandidateFiles -eq 5 -and $s.FilesFullyScanned -eq 3 -and $s.CorruptedUnreadable -eq 1 -and $s.FilesSkipped -eq 1)
+    Assert-True (@($s.Findings | Where-Object { $_.Verdict -eq 'DETECTED' -and $_.VerificationStatus -eq 'VERIFIED' }).Count -eq 3)
+}
+Test-Case 'Parallel clean-hash conflict is never detected' {
+    $hash=Get-CachedFileSha256 $plain
+    Set-TestDatabase @((New-TestSignature SHA256 $hash)) @([pscustomobject]@{ SHA256=$hash })
+    $s=New-ScanState File
+    Invoke-ParallelInspection -Files @($plain,(Join-Path $testDirectory 'performance.jar')) -State $s -WorkerLimit 2 -AlwaysRecord | Out-Null
+    Assert-True ($s.Findings.Count -eq 2 -and @($s.Findings | Where-Object VerificationStatus -ne 'CONFLICTING').Count -eq 0 -and @($s.Findings | Where-Object Verdict -eq 'DETECTED').Count -eq 0)
+}
+Test-Case 'Parallel cancellation disposes every runspace and reports incomplete source' {
+    Set-TestDatabase
+    $files=@(0..5 | ForEach-Object { Join-Path $testDirectory "parallel-$_.jar" })
+    $before=@(Get-Runspace).Count; $s=New-ScanState File
+    $cancel=[Threading.CancellationTokenSource]::new(); $cancel.CancelAfter(400)
+    $cancelled=$false
+    try { Invoke-ParallelInspection -Files $files -State $s -WorkerLimit 2 -CancellationToken $cancel.Token | Out-Null }
+    catch { $cancelled=$true }
+    finally { $cancel.Dispose() }
+    Assert-True ($cancelled -and $null -eq $s.CompletedUtc -and $s.UnavailableSources.Count -gt 0 -and @(Get-Runspace).Count -eq $before)
+}
+Test-Case 'Parallel repeated scan starts with a fresh isolated signature snapshot' {
+    Set-TestDatabase; $s=New-ScanState File
+    Invoke-ParallelInspection -Files @($plain,$plain) -State $s -WorkerLimit 2 -AlwaysRecord | Out-Null
+    Assert-True ($s.CandidateFiles -eq 1 -and $s.Findings.Count -eq 1 -and $s.Findings[0].Verdict -eq 'INFO')
+}
+Test-Case 'Worker initialization failure cannot silently complete the scan' {
+    Set-TestDatabase; $s=New-ScanState File; $before=@(Get-Runspace).Count
+    $originalPath=$script:ScannerScriptPath; $failed=$false
+    try {
+        $script:ScannerScriptPath='no-scanner-functions-for-this-failure-test'
+        Invoke-ParallelInspection -Files @($plain) -State $s -WorkerLimit 1 | Out-Null
+    } catch { $failed=$true }
+    finally { $script:ScannerScriptPath=$originalPath }
+    Assert-True ($failed -and $s.FilesFullyScanned -eq 0 -and $s.UnavailableSources.Count -gt 0 -and @(Get-Runspace).Count -eq $before)
+}
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     Test-Case 'Pure PowerShell console API bindings work on this runtime' {
         $api=Get-ConsoleNativeApi
@@ -261,6 +328,14 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         else { Set-Content -LiteralPath $hostPath -Stream payload -Encoding Byte -Value $data }
         $s=New-ScanState ADS; $f=Inspect-AdsPayload $hostPath (Get-Item -LiteralPath $hostPath -Stream payload) $s
         Assert-True ($f.Evidence.Count -eq 1 -and $f.Verdict -ne 'DETECTED')
+    }
+    Test-Case 'Parallel ADS retains verified payloads, normal metadata and inaccessible hosts' {
+        Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $plain)))
+        $s=New-ScanState ADS
+        $files=@((Join-Path $testDirectory 'notes.txt'),(Join-Path $testDirectory 'inventory.txt'),(Join-Path $testDirectory 'missing-ads-host.txt'))
+        $errors=Invoke-ParallelInspection -Files $files -State $s -TaskMode ADS -WorkerLimit 2
+        Assert-True ($errors -eq 1 -and $s.FilesSkipped -eq 1 -and $s.AdsFindings -eq 1 -and $s.Findings[0].Verdict -eq 'DETECTED')
+        Assert-True (@($s.Evidence | Where-Object Source -eq 'Zone.Identifier').Count -eq 1)
     }
 } else {
     [void]$testResults.Add([pscustomobject]@{ Test='NTFS ADS integration'; Result='NOT RUN'; Error='Windows/NTFS required' })

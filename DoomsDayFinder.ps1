@@ -15,7 +15,8 @@ param(
     [string]$Path,
     [switch]$Deep,
     [switch]$NoPause,
-    [switch]$PassThru
+    [switch]$PassThru,
+    [ValidateRange(1,8)][int]$Workers = [Math]::Max(1,[Math]::Min(4,[Environment]::ProcessorCount))
 )
 
 Set-StrictMode -Version 2.0
@@ -23,7 +24,11 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.2.2'
+$script:ToolVersion = '1.3.0'
+$script:ScannerScriptPath = $MyInvocation.MyCommand.Path
+$script:WorkerCount = $Workers
+$script:IsWorker = $false
+$script:WorkerCancellation = $null
 $script:ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:SignaturePath = Join-Path $script:ProjectRoot 'signatures\doomsday.json'
 $script:ReportDirectory = Join-Path $script:ProjectRoot 'Reports'
@@ -90,11 +95,12 @@ function New-ScanState {
         AnalyzedSources = [System.Collections.ArrayList]::new()
         UnavailableSources = [System.Collections.ArrayList]::new()
         Statistics = [ordered]@{}
-        Performance = [ordered]@{ ElapsedSeconds=0.0; PhaseTimings=@(); ClassCacheHits=0L; ClassCacheMisses=0L; InventoryFiles=0 }
+        Performance = [ordered]@{ ElapsedSeconds=0.0; PhaseTimings=@(); ClassCacheHits=0L; ClassCacheMisses=0L; InventoryFiles=0; Workers=1; ParallelJobs=0; PeakActive=0; WorkerDiagnostics=@() }
     }
 }
 
 function Test-IsAdministrator {
+    if ($script:IsWorker) { return $script:WorkerAdministrator }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $false }
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -105,6 +111,7 @@ function Test-IsAdministrator {
 
 function Write-Color {
     param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Magenta)
+    if ($script:IsWorker) { return }
     if ($script:ProgressWidth -gt 0) {
         Write-Host ("`r" + (' ' * $script:ProgressWidth) + "`r") -NoNewline
         $script:ProgressWidth = 0
@@ -121,6 +128,7 @@ function Write-Section {
 
 function Write-Stage {
     param([string]$Stage, [string]$Message, [ConsoleColor]$Color = [ConsoleColor]::DarkMagenta)
+    if ($script:IsWorker) { return }
     $safeStage = if ([string]::IsNullOrWhiteSpace($Stage)) { 'SCAN' } else { $Stage.ToUpperInvariant() }
     if ($null -ne $script:PhaseClock -and $safeStage -ne $script:ActivePhase) {
         [void]$script:PhaseTimings.Add([pscustomobject]@{ Phase=$script:ActivePhase; Seconds=[Math]::Round($script:PhaseClock.Elapsed.TotalSeconds,3) })
@@ -156,6 +164,7 @@ function Write-ScanProgress {
         [int]$Total,
         [switch]$Completed
     )
+    if ($script:IsWorker) { return }
     if ($Completed) {
         if ($script:ProgressWidth -gt 0) { Write-Host ("`r" + (' ' * $script:ProgressWidth) + "`r") -NoNewline; $script:ProgressWidth=0 }
         $script:ProgressLastUpdate=[DateTime]::MinValue
@@ -592,6 +601,7 @@ function Read-ContentInspection {
     $actualType = 'Unknown'
     try {
         while (($count = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            Test-WorkerCancellation
             $total += $count
             if ($script:ProgressTotal -gt 0 -and $total -ge 1048576 -and ([DateTime]::UtcNow-$script:ProgressLastUpdate).TotalMilliseconds -ge 150) {
                 Write-ScanProgress -Current $script:ProgressCurrent -Total $script:ProgressTotal -Status ('Reading content: {0:N1} MiB' -f ($total/1MB))
@@ -650,6 +660,7 @@ function Read-JavaClassIndex {
         $pool = New-Object object[] $count
         $classes = @{}
         for ($i=1; $i -lt $count; $i++) {
+            if (($i -band 127) -eq 0) { Test-WorkerCancellation }
             $tag = [int]$reader.ReadByte()
             if ($tag -eq 1) { $length=(([int]$reader.ReadByte() -shl 8) -bor [int]$reader.ReadByte()); $textBytes=$reader.ReadBytes($length); if ($textBytes.Length -ne $length) { throw 'Truncated constant pool UTF8.' }; $pool[$i]=[Text.Encoding]::UTF8.GetString($textBytes) }
             elseif ($tag -eq 7) { $classes[$i]=(([int]$reader.ReadByte() -shl 8) -bor [int]$reader.ReadByte()) }
@@ -769,6 +780,7 @@ function Inspect-ZipStream {
         if ($Budget.Entries -gt $script:Limits.MaximumEntryCount) { throw [IO.InvalidDataException]::new('ZIP cumulative entry-count safety limit exceeded.') }
         $declared=0L
         foreach ($entry in $entries) {
+            Test-WorkerCancellation
             $declared += [long]$entry.Length
             if ($declared -gt $script:Limits.MaximumDecompressedBytes) { throw [IO.InvalidDataException]::new('ZIP decompressed-size safety limit exceeded.') }
             if ($entry.Length -gt 1048576 -and ($entry.CompressedLength -eq 0 -or ([double]$entry.Length/[Math]::Max(1,$entry.CompressedLength)) -gt $script:Limits.MaximumCompressionRatio)) { throw [IO.InvalidDataException]::new('ZIP compression-ratio safety limit exceeded.') }
@@ -781,6 +793,7 @@ function Inspect-ZipStream {
         $contentPlan=Get-ContentScanPlan $contentSigs
         $hashSigs=@(Get-SignaturesByType @('SHA256'))
         foreach ($entry in $entries) {
+            Test-WorkerCancellation
             $name=$entry.FullName.Replace('\','/')
             if ($script:ProgressTotal -gt 0) { Write-ScanProgress -Current $script:ProgressCurrent -Total $script:ProgressTotal -Status ("Archive entries: {0:N0}; classes analyzed: {1:N0}" -f $entries.Count,$result.ClassesAnalyzed) }
             if (-not $name -or $name.EndsWith('/')) { continue }
@@ -1132,7 +1145,8 @@ function Invoke-FileInspection {
             $script:InspectionCache[$inspectionKey]=$compact
         } else { $script:InspectionCache[$inspectionKey] = $finding }
         return $finding
-    } catch [IO.InvalidDataException] {
+    } catch [OperationCanceledException] { throw }
+    catch [IO.InvalidDataException] {
         $State.CorruptedUnreadable++
         Add-ScanWarning $State 'ARCHIVE' $_.Exception.Message $item.FullName
         return $null
@@ -1260,6 +1274,169 @@ function Get-CandidateFiles {
     return @($files | Sort-Object)
 }
 
+function Test-WorkerCancellation {
+    if ($null -ne $script:WorkerCancellation) { $script:WorkerCancellation.ThrowIfCancellationRequested() }
+}
+
+function Initialize-ScannerWorker {
+    param([string]$ConfigurationJson,[Threading.CancellationToken]$Token)
+    Set-StrictMode -Version 2.0
+    $script:ErrorActionPreference='Stop'
+    $config=$ConfigurationJson | ConvertFrom-Json
+    $script:IsWorker=$true; $script:WorkerCancellation=$Token
+    $script:WorkerAdministrator=[bool]$config.IsAdministrator
+    $script:ToolVersion=$config.ToolVersion; $script:ProjectRoot=$config.ProjectRoot
+    $script:Signatures=$config.Signatures; $script:GenericIndicators=@($config.GenericIndicators)
+    $script:Limits=[ordered]@{}
+    foreach ($property in $config.Limits.PSObject.Properties) { $script:Limits[$property.Name]=$property.Value }
+    $script:HashCache=@{}; $script:InspectionCache=@{}; $script:ContentPlanCache=@{}
+    $script:ClassIndexCache=@{}; $script:ClassIndexCacheOrder=[Collections.Generic.Queue[string]]::new()
+    $script:ClassIndexCacheBytes=0L; $script:ClassCacheHits=0L; $script:ClassCacheMisses=0L
+    $script:WarningConsoleLimit=0; $script:ProgressWidth=0; $script:ProgressTotal=0
+    $script:ProgressCurrent=0; $script:ProgressLastUpdate=[DateTime]::MinValue
+    $script:ScanClock=$null; $script:PhaseClock=$null
+}
+
+function Invoke-ScannerWorker {
+    param($Tasks,$Results,$Active,[Threading.CancellationToken]$Token,[int]$WorkerId,[string]$ConfigurationJson,[string]$TaskMode,[bool]$AlwaysRecord)
+    Initialize-ScannerWorker $ConfigurationJson $Token
+    $task=$null
+    while (-not $Token.IsCancellationRequested -and $Tasks.TryDequeue([ref]$task)) {
+        $Active[$WorkerId]=[string]$task
+        $started=[DateTime]::UtcNow
+        $state=New-ScanState $TaskMode
+        $hits=$script:ClassCacheHits; $misses=$script:ClassCacheMisses
+        $adsErrors=0; $finding=$null
+        try {
+            Test-WorkerCancellation
+            if ($TaskMode -eq 'ADS') { $adsErrors=Read-AdsHostEvidence -HostPath ([string]$task) -State $state }
+            else { $finding=Invoke-FileInspection -LiteralPath ([string]$task) -State $state -QuietProgress -AlwaysRecord:$AlwaysRecord }
+            Test-WorkerCancellation
+        } catch [OperationCanceledException] { throw }
+        catch {
+            if ($TaskMode -eq 'ADS') { $adsErrors++; $state.FilesSkipped++ }
+            else { if ($state.CandidateFiles -eq 0) { $state.CandidateFiles++ }; $state.CorruptedUnreadable++ }
+            Add-ScanWarning $state 'WORKER' $_.Exception.Message ([string]$task)
+        } finally {
+            $removed=''; [void]$Active.TryRemove($WorkerId,[ref]$removed)
+        }
+        # Each result transfers ownership of its state and cache entries to the
+        # coordinator. Only class/byte-plan caches remain local to this worker.
+        $result=[pscustomobject]@{
+            Path=[string]$task; State=$state; AdsErrors=$adsErrors
+            InspectionCache=$script:InspectionCache; HashCache=$script:HashCache
+            ClassCacheHits=$script:ClassCacheHits-$hits; ClassCacheMisses=$script:ClassCacheMisses-$misses
+            WorkerId=$WorkerId; StartedUtc=$started; FinishedUtc=[DateTime]::UtcNow
+        }
+        $script:InspectionCache=@{}; $script:HashCache=@{}; $finding=$null
+        $Results.Add($result,$Token)
+        $task=$null; $result=$null; $state=$null
+    }
+}
+
+function Merge-WorkerResult {
+    param($Result,$State,[switch]$CaptureDiagnostics)
+    $part=$Result.State
+    foreach ($name in @('TotalIndexesExtracted','CandidateFiles','FilesFound','FilesFullyScanned','FilesSkipped','PartialFiles','CorruptedUnreadable','AdsFindings')) { $State.$name += $part.$name }
+    foreach ($name in @('Findings','Evidence','Integrity','Processes','AnalyzedSources','UnavailableSources')) {
+        foreach ($record in $part.$name) { [void]$State.$name.Add($record) }
+    }
+    foreach ($warning in $part.Warnings) { Add-ScanWarning $State $warning.Source $warning.Message $warning.Path }
+    foreach ($key in $Result.InspectionCache.Keys) { $script:InspectionCache[$key]=$Result.InspectionCache[$key] }
+    foreach ($key in $Result.HashCache.Keys) { $script:HashCache[$key]=$Result.HashCache[$key] }
+    $script:ClassCacheHits += $Result.ClassCacheHits; $script:ClassCacheMisses += $Result.ClassCacheMisses
+    $State.Performance.ParallelJobs++
+    if ($CaptureDiagnostics) {
+        $State.Performance.WorkerDiagnostics += [pscustomobject]@{ Path=$Result.Path; WorkerId=$Result.WorkerId; StartedUtc=$Result.StartedUtc; FinishedUtc=$Result.FinishedUtc }
+    }
+}
+
+function Invoke-ParallelInspection {
+    param([string[]]$Files,$State,[ValidateSet('FILE','ADS')][string]$TaskMode='FILE',
+        [ValidateRange(1,8)][int]$WorkerLimit=$script:WorkerCount,[switch]$AlwaysRecord,[switch]$CaptureDiagnostics,
+        [Threading.CancellationToken]$CancellationToken=[Threading.CancellationToken]::None)
+    if ($Files.Count -eq 0) { return 0 }
+    if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'Parallel inspection is unavailable under the current PowerShell language policy.' }
+    $limit=[Math]::Min($WorkerLimit,$Files.Count)
+    $State.Performance.Workers=[Math]::Max($State.Performance.Workers,$limit)
+    $initial=[Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $initial.LanguageMode=$ExecutionContext.SessionState.LanguageMode
+    # Use only scanner functions already loaded from this script. Evidence,
+    # signature JSON and paths are passed as arguments, never parsed as code.
+    foreach ($function in Get-ChildItem Function:) {
+        if ($function.ScriptBlock.File -eq $script:ScannerScriptPath) {
+            $initial.Commands.Add([Management.Automation.Runspaces.SessionStateFunctionEntry]::new($function.Name,$function.Definition))
+        }
+    }
+    $configuration=[pscustomobject]@{ ToolVersion=$script:ToolVersion; ProjectRoot=$script:ProjectRoot; Signatures=$script:Signatures; GenericIndicators=$script:GenericIndicators; Limits=$script:Limits; IsAdministrator=$State.IsAdministrator } | ConvertTo-Json -Depth 20 -Compress
+    $tasks=[Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $Files) { if ($seen.Add($file)) { $tasks.Enqueue($file) } }
+    $total=$tasks.Count
+    $results=[Collections.Concurrent.BlockingCollection[object]]::new($limit*2)
+    $active=[Collections.Concurrent.ConcurrentDictionary[int,string]]::new()
+    $cancel=[Threading.CancellationTokenSource]::CreateLinkedTokenSource($CancellationToken,[Threading.CancellationToken]::None)
+    $jobs=[Collections.Generic.List[object]]::new(); $pool=$null
+    $completed=0; $adsErrors=0
+    try {
+        $cancel.Token.ThrowIfCancellationRequested()
+        $pool=[Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($initial)
+        [void]$pool.SetMaxRunspaces($limit); [void]$pool.SetMinRunspaces($limit)
+        $pool.ThreadOptions=[Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $pool.Open()
+        for ($workerId=0; $workerId -lt $limit; $workerId++) {
+            $engine=[Management.Automation.PowerShell]::Create()
+            $engine.RunspacePool=$pool
+            [void]$engine.AddCommand('Invoke-ScannerWorker').AddArgument($tasks).AddArgument($results).AddArgument($active).AddArgument($cancel.Token).AddArgument($workerId).AddArgument($configuration).AddArgument($TaskMode).AddArgument([bool]$AlwaysRecord)
+            $job=[pscustomobject]@{ Engine=$engine; Async=$null; Ended=$false }
+            $jobs.Add($job)
+            $job.Async=$engine.BeginInvoke()
+        }
+        while ($completed -lt $total) {
+            $cancel.Token.ThrowIfCancellationRequested()
+            $State.Performance.PeakActive=[Math]::Max($State.Performance.PeakActive,$active.Count)
+            $result=$null
+            if ($results.TryTake([ref]$result,100)) {
+                Merge-WorkerResult $result $State -CaptureDiagnostics:$CaptureDiagnostics
+                $adsErrors += $result.AdsErrors; $completed++
+            }
+            Write-ScanProgress -Current $completed -Total $total -Status ('{0} | Active: {1}/{2}' -f $TaskMode,$active.Count,$limit)
+            $allEnded=$true
+            foreach ($job in $jobs) {
+                if (-not $job.Ended -and $job.Async.IsCompleted) {
+                    [void]$job.Engine.EndInvoke($job.Async); $job.Ended=$true
+                    if ($job.Engine.HadErrors) { throw ('Worker failed: '+($job.Engine.Streams.Error | Out-String)) }
+                }
+                if (-not $job.Ended) { $allEnded=$false }
+            }
+            if ($allEnded -and $results.Count -eq 0 -and $completed -lt $total) { throw "$($total-$completed) artifacts remain unanalyzed after a worker failure." }
+        }
+        foreach ($job in $jobs) {
+            if (-not $job.Ended) { [void]$job.Engine.EndInvoke($job.Async); $job.Ended=$true }
+            if ($job.Engine.HadErrors) { throw ('Worker failed: '+($job.Engine.Streams.Error | Out-String)) }
+        }
+        return $adsErrors
+    } catch {
+        Add-SourceStatus $State ('Parallel '+$TaskMode) $false "$completed / $total completed: $($_.Exception.Message)"
+        throw
+    } finally {
+        $cancel.Cancel()
+        # Signal all workers before waiting for any one of them. No detached
+        # child processes or orphaned jobs are created by this scheduler.
+        $stops=[Collections.Generic.List[object]]::new()
+        foreach ($job in $jobs) {
+            if ($null -ne $job.Async -and -not $job.Async.IsCompleted) {
+                try { $stops.Add([pscustomobject]@{ Engine=$job.Engine; Async=$job.Engine.BeginStop($null,$null) }) } catch { }
+            }
+        }
+        foreach ($stop in $stops) { try { $stop.Engine.EndStop($stop.Async) } catch { } }
+        foreach ($job in $jobs) { $job.Engine.Dispose() }
+        if ($null -ne $pool) { $pool.Dispose() }
+        $results.Dispose(); $cancel.Dispose()
+        Write-ScanProgress -Completed
+    }
+}
+
 function Invoke-CandidateScan {
     param([string[]]$Roots, $State, [switch]$Full)
     $files=@(Get-CandidateFiles -Roots $Roots -State $State -Full:$Full)
@@ -1267,10 +1444,15 @@ function Invoke-CandidateScan {
     Write-Stage 'SCAN' ("TOTAL FILES: {0:N0} | Detailed content inspection; no class-count skip." -f $files.Count)
     $script:ProgressTotal=$files.Count
     try {
-        for ($index=0; $index -lt $files.Count; $index++) {
-            $script:ProgressCurrent=$index
-            Write-ScanProgress -Status 'Detailed file inspection' -Current $index -Total $files.Count
-            Invoke-FileInspection -LiteralPath $files[$index] -State $State -QuietProgress | Out-Null
+        if ($script:WorkerCount -gt 1 -and $files.Count -gt 1) {
+            Write-Stage 'SCAN' ("Parallel file inspection: up to {0} workers; all classes remain in scope." -f $script:WorkerCount)
+            Invoke-ParallelInspection -Files $files -State $State | Out-Null
+        } else {
+            for ($index=0; $index -lt $files.Count; $index++) {
+                $script:ProgressCurrent=$index
+                Write-ScanProgress -Status 'Detailed file inspection' -Current $index -Total $files.Count
+                Invoke-FileInspection -LiteralPath $files[$index] -State $State -QuietProgress | Out-Null
+            }
         }
         Write-ScanProgress -Status 'File phase complete' -Current $files.Count -Total $files.Count
     } finally { Write-ScanProgress -Completed; $script:ProgressTotal=0 }
@@ -1611,6 +1793,37 @@ function Inspect-AdsPayload {
     } finally { $stream.Dispose() }
 }
 
+function Read-AdsHostEvidence {
+    param([string]$HostPath,$State)
+    $errors=0
+    try {
+        Test-WorkerCancellation
+        $streams=@(Get-Item -LiteralPath $HostPath -Stream * -ErrorAction Stop)
+        foreach ($streamInfo in $streams) {
+            Test-WorkerCancellation
+            $name=[string]$streamInfo.Stream
+            if ($name -in @(':$DATA','::$DATA','$DATA')) { continue }
+            try {
+                if ($name -ieq 'Zone.Identifier') {
+                    $zoneMagic=Get-MagicInfo "$HostPath`:$name"
+                    if ($zoneMagic.ActualType -in @('Windows PE','Java Archive / ZIP','Java Class')) {
+                        Inspect-AdsPayload -HostPath $HostPath -StreamInfo $streamInfo -State $State | Out-Null
+                    } else {
+                        $zone=Get-ZoneIdentifier -HostPath $HostPath -StreamName $name
+                        [void]$State.Evidence.Add([pscustomobject][ordered]@{
+                            Source='Zone.Identifier'; HostPath=$HostPath; Stream=$name; Length=[long]$streamInfo.Length
+                            ZoneId=$zone.ZoneId; ReferrerUrl=$zone.ReferrerUrl; HostUrl=$zone.HostUrl
+                        })
+                    }
+                } else { Inspect-AdsPayload -HostPath $HostPath -StreamInfo $streamInfo -State $State | Out-Null }
+            } catch [OperationCanceledException] { throw }
+            catch { $errors++; $State.CorruptedUnreadable++; Add-ScanWarning $State 'ADS' $_.Exception.Message "$HostPath`:$name" }
+        }
+    } catch [OperationCanceledException] { throw }
+    catch { $errors++; $State.FilesSkipped++; Add-ScanWarning $State 'ADS' $_.Exception.Message $HostPath }
+    return $errors
+}
+
 function Invoke-AdsScan {
     param([string[]]$Roots, $State, [switch]$DeepScan, [string[]]$FileInventory)
     Write-Stage 'ADS' 'Enumerating NTFS alternate data streams (read-only)...'
@@ -1628,36 +1841,15 @@ function Invoke-AdsScan {
     $adsErrors=0
     $fileList = @($files | Sort-Object)
     if ($fileList.Count -gt 0) { Write-Stage 'ADS' ("Checking ADS on {0:N0} files with one-line progress." -f $fileList.Count) }
-    $fileIndex = 0
-    foreach ($file in $fileList) {
-        $fileIndex++
-        Write-ScanProgress -Activity 'Reveal ScreenShare - ADS analysis' -Status 'Reading named streams' -Current $fileIndex -Total $fileList.Count
-        try {
-            $streams = @(Get-Item -LiteralPath $file -Stream * -ErrorAction Stop)
-            foreach ($streamInfo in $streams) {
-                $name = [string]$streamInfo.Stream
-                if ($name -in @(':$DATA','::$DATA','$DATA')) { continue }
-                if ($name -ieq 'Zone.Identifier') {
-                    $zoneMagic=Get-MagicInfo "$file`:$name"
-                    if ($zoneMagic.ActualType -in @('Windows PE','Java Archive / ZIP','Java Class')) {
-                        Inspect-AdsPayload -HostPath $file -StreamInfo $streamInfo -State $State | Out-Null
-                        continue
-                    }
-                    $zone = Get-ZoneIdentifier -HostPath $file -StreamName $name
-                    [void]$State.Evidence.Add([pscustomobject][ordered]@{
-                        Source='Zone.Identifier'; HostPath=$file; Stream=$name; Length=[long]$streamInfo.Length
-                        ZoneId=$zone.ZoneId; ReferrerUrl=$zone.ReferrerUrl; HostUrl=$zone.HostUrl
-                    })
-                    continue
-                }
-                try { Inspect-AdsPayload -HostPath $file -StreamInfo $streamInfo -State $State | Out-Null }
-                catch { $adsErrors++; $State.CorruptedUnreadable++; Add-ScanWarning $State 'ADS' $_.Exception.Message "$file`:$name" }
-            }
-        } catch [System.Management.Automation.ParameterBindingException] {
-            Add-ScanWarning $State 'ADS' 'The current filesystem/provider does not expose the Stream parameter.' $file
-            $adsErrors++; $State.FilesSkipped += $fileList.Count-$fileIndex+1
-            break
-        } catch { $adsErrors++; $State.FilesSkipped++; Add-ScanWarning $State 'ADS' $_.Exception.Message $file }
+    if ($script:WorkerCount -gt 1 -and $fileList.Count -gt 1) {
+        $adsErrors=Invoke-ParallelInspection -Files $fileList -State $State -TaskMode ADS
+    } else {
+        $fileIndex=0
+        foreach ($file in $fileList) {
+            $fileIndex++
+            Write-ScanProgress -Activity 'ADS' -Status 'Reading named streams' -Current $fileIndex -Total $fileList.Count
+            $adsErrors += Read-AdsHostEvidence -HostPath $file -State $State
+        }
     }
     Write-ScanProgress -Activity 'Reveal ScreenShare - ADS analysis' -Completed
     if ($fileList.Count -gt 0) { Write-Color ("[ADS] {0:N0} files checked; {1:N0} named payload streams found." -f $fileList.Count, $State.AdsFindings) Magenta }
@@ -2216,6 +2408,7 @@ function Show-ScanComplete {
         'High confidence findings'=$State.Statistics.HighConfidenceFindings; 'Suspicious findings'=$State.Statistics.SuspiciousFindings
         'Deleted traces'=$State.Statistics.DeletedTraces; 'ADS findings'=$State.Statistics.AdsFindings
         'Elapsed time'=[TimeSpan]::FromSeconds($State.Performance.ElapsedSeconds).ToString('hh\:mm\:ss')
+        'Parallel workers'=$State.Performance.Workers; 'Parallel jobs completed'=$State.Performance.ParallelJobs
     }
     foreach ($key in $rows.Keys) { Write-Color (('{0,-26}: {1}' -f $key, $rows[$key])) Magenta }
     Write-Host ''
@@ -2244,6 +2437,7 @@ function Convert-ReportToText {
     [void]$builder.AppendLine('=' * 60); [void]$builder.AppendLine('REVEAL SCREENSHARE - DOOMSDAY FINDER REPORT'); [void]$builder.AppendLine('=' * 60)
     [void]$builder.AppendLine("Tool Version: $($State.ToolVersion)")
     [void]$builder.AppendLine("Elapsed seconds: $($State.Performance.ElapsedSeconds)")
+    [void]$builder.AppendLine("Parallel workers: $($State.Performance.Workers); jobs completed: $($State.Performance.ParallelJobs); peak active observed: $($State.Performance.PeakActive)")
     foreach ($timing in $State.Performance.PhaseTimings) { [void]$builder.AppendLine("Phase $($timing.Phase): $($timing.Seconds) seconds") }
     [void]$builder.AppendLine("Scan ID: $($State.ScanId)")
     [void]$builder.AppendLine("Mode: $($State.Mode)")
