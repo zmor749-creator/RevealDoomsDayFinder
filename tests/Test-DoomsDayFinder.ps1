@@ -62,6 +62,15 @@ function Inspect-TestFile {
 Set-TestDatabase
 $plain=New-TestArchive 'clean.jar' 1 @{ 'fixture/resource.txt'=[Text.Encoding]::UTF8.GetBytes('fixture-only-marker-7fe56cd1') }
 Test-Case 'Core self-test' { Assert-True (Invoke-BuiltInSelfTest) }
+Test-Case 'Purple startup smile appears once and produces no success-stream data' {
+    $output=@(Show-RevealSmile 6>&1)
+    Assert-True ($output.Count -eq 1 -and $output[0].ToString().Trim() -ceq '(^_^)')
+    Assert-True ($output[0].MessageData.ForegroundColor -eq [ConsoleColor]::Magenta)
+    $banner=Show-RevealBanner 6>&1 | Out-String
+    Assert-True ([regex]::Matches($banner,'\(\^_\^\)').Count -eq 1 -and $banner.Contains('REVEAL SCREENSHARE'))
+    $success=@(Show-RevealSmile 6>$null)
+    Assert-True ($success.Count -eq 0)
+}
 Test-Case 'Unknown total never displays division by zero or fake percentage' {
     $line=Format-ScanProgressLine -Status 'Candidates: 120; counting' -Current 16182 -Total 0
     Assert-True ($line -like '[[]INDEX]*' -and $line -notmatch '/\s*0|%' -and $line -match 'Candidates: 120')

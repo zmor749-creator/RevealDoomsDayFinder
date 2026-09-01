@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.4.1'
+$script:ToolVersion = '1.4.2'
 $script:DetailedOutput = [bool]$DetailedOutput
 $script:AnalysisProfile = 'Detailed'
 $script:PrefetchNativeApi = $null
@@ -143,7 +143,14 @@ function Write-Stage {
     Write-Color (('[{0}] {1}' -f $safeStage, $Message)) $Color
 }
 
+function Show-RevealSmile {
+    # ASCII face avoids missing emoji glyphs in Windows PowerShell console fonts.
+    # Decoration only: no animation, delay, input wait or detection semantics.
+    Write-Host ((' ' * 27) + '(^_^)') -ForegroundColor Magenta
+}
+
 function Show-RevealBanner {
+    Show-RevealSmile
     $banner = @'
 ============================================================
                     REVEAL SCREENSHARE

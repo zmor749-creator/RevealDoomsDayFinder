@@ -1,6 +1,8 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.4.1.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.4.2.
+
+Başlangıç başlığında mor `(^_^)` gülen yüz bulunur. Yalnızca görseldir; taramayı bekletmez, sonuç ekranını veya tespit mantığını değiştirmez. Konsol fontlarında emoji sorunu olmaması için ASCII karakterleri kullanılır.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
