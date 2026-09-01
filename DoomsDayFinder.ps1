@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.2.0'
 $script:ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:SignaturePath = Join-Path $script:ProjectRoot 'signatures\doomsday.json'
 $script:ReportDirectory = Join-Path $script:ProjectRoot 'Reports'
@@ -37,6 +37,10 @@ $script:InspectionCache = @{}
 $script:Signatures = $null
 $script:LastReport = $null
 $script:WarningConsoleLimit = 12
+$script:ProgressWidth = 0
+$script:ProgressLastUpdate = [DateTime]::MinValue
+$script:ProgressCurrent = 0
+$script:ProgressTotal = 0
 $script:Limits = [ordered]@{
     MaximumRecursion = 3
     MaximumDecompressedBytes = 536870912L
@@ -55,11 +59,15 @@ function New-ScanState {
         StartedUtc = [DateTime]::UtcNow
         CompletedUtc = $null
         IsAdministrator = Test-IsAdministrator
+        SignatureCount = @(Get-SignaturesByType @('SHA256','Class','Package','Resource','Manifest','ModId','OriginalFilename','String','ByteSequence','StructuralFingerprint','EmbeddedNative','LoaderIndicator','RuntimeIndicator')).Count
+        VerifiedSignatureCount = @($script:Signatures.signatures | Where-Object { $_.PSObject.Properties['Verified'] -and $_.Verified -is [bool] -and $_.Verified -and (-not $_.PSObject.Properties['Enabled'] -or $_.Enabled) }).Count
         TotalIndexesExtracted = 0
         CandidateFiles = 0
         FilesFound = 0
         FilesFullyScanned = 0
         FilesSkipped = 0
+        DiscoveredFiles = 0
+        PartialFiles = 0
         CorruptedUnreadable = 0
         AdsFindings = 0
         Findings = [System.Collections.ArrayList]::new()
@@ -84,6 +92,10 @@ function Test-IsAdministrator {
 
 function Write-Color {
     param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Magenta)
+    if ($script:ProgressWidth -gt 0) {
+        Write-Host ("`r" + (' ' * $script:ProgressWidth) + "`r") -NoNewline
+        $script:ProgressWidth = 0
+    }
     Write-Host $Text -ForegroundColor $Color
 }
 
@@ -119,13 +131,19 @@ function Write-ScanProgress {
         [int]$Total,
         [switch]$Completed
     )
-    if ([string]::IsNullOrWhiteSpace($Activity)) { $Activity = 'Reveal ScreenShare scan' }
     if ($Completed) {
-        Write-Progress -Activity $Activity -Completed
+        if ($script:ProgressWidth -gt 0) { Write-Host ("`r" + (' ' * $script:ProgressWidth) + "`r") -NoNewline; $script:ProgressWidth=0 }
         return
     }
+    if (($Current -lt $Total) -and (([DateTime]::UtcNow-$script:ProgressLastUpdate).TotalMilliseconds -lt 150)) { return }
+    $script:ProgressLastUpdate=[DateTime]::UtcNow
     $percent = if ($Total -gt 0) { [Math]::Min(100, [Math]::Floor(($Current * 100.0) / $Total)) } else { 0 }
-    Write-Progress -Activity $Activity -Status $Status -PercentComplete $percent
+    $line = '[SCAN] {0:N0} / {1:N0} | {2}% | {3}' -f $Current,$Total,$percent,$Status
+    $width=100
+    try { if ($Host.UI.RawUI.WindowSize.Width -gt 10) { $width=$Host.UI.RawUI.WindowSize.Width-1 } } catch { }
+    if ($line.Length -gt $width) { $line=$line.Substring(0,$width) }
+    Write-Host ("`r" + $line.PadRight([Math]::Min($width,[Math]::Max($script:ProgressWidth,$line.Length)))) -NoNewline -ForegroundColor Magenta
+    $script:ProgressWidth=$line.Length
 }
 
 function ConvertTo-SafeDateString {
@@ -152,8 +170,9 @@ function Add-ScanWarning {
 
 function Add-SourceStatus {
     param($State, [string]$Source, [bool]$Available, [string]$Detail = '')
-    $target = if ($Available) { $State.AnalyzedSources } else { $State.UnavailableSources }
-    [void]$target.Add([pscustomobject]@{ Source = $Source; Detail = $Detail })
+    $record = [pscustomobject]@{ Source = $Source; Detail = $Detail }
+    if ($Available) { [void]$State.AnalyzedSources.Add($record) }
+    else { [void]$State.UnavailableSources.Add($record) }
 }
 
 function ConvertTo-SafeArray {
@@ -171,28 +190,85 @@ function Test-GenericIndicator {
 
 function Import-DoomsDaySignatures {
     if (-not (Test-Path -LiteralPath $script:SignaturePath -PathType Leaf)) {
-        $script:Signatures = [pscustomobject]@{
-            schemaVersion = 1
-            family = 'DoomsDay'
-            databaseVersion = 'embedded-safe-empty-1'
-            generatedUtc = '2026-09-01T00:00:00Z'
-            signatures = @()
-            knownCleanHashes = @()
-        }
-        Write-Color '[WARNING] signatures\doomsday.json was not found. Safe empty embedded database loaded; DETECTED is disabled until verified signatures are installed.' Yellow
-        return $script:Signatures
+        # Same unverified research data as the distributed JSON. No verified family hashes are invented.
+        $raw = @'
+{
+  "schemaVersion": 1,
+  "family": "DoomsDay",
+  "databaseVersion": "2026-09-01-community-research",
+  "generatedUtc": "2026-09-01T00:00:00Z",
+  "notes": "Community byte patterns have not been validated against authentic DoomsDay samples. They can produce review findings but cannot authorize DETECTED. Overlapping patterns share one independence group. No detection-rate claim is supported.",
+  "signatures": [
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-1",
+      "Type": "ByteSequence",
+      "Value": "6161370E160609949E0029033EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A160C14005C6588B800",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
+    },
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-2",
+      "Type": "ByteSequence",
+      "Value": "0C1504851D85160A6161370E160609949E0029033EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A16",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
+    },
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-3",
+      "Type": "ByteSequence",
+      "Value": "5910071088544C2A2BB8004D3B033DA7000A2B1C03548402011C1008A1FFF61A9E000C1A110800A2000503AC04AC00000000000A0005004E000101FA000001D3",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
     }
-    $raw = Get-Content -LiteralPath $script:SignaturePath -Raw -Encoding UTF8
+  ],
+  "knownCleanHashes": []
+}
+'@
+        Write-Color '[WARNING] Local signature JSON not found; embedded unverified community patterns loaded. DETECTED remains disabled.' Yellow
+    } else {
+        $raw = Get-Content -LiteralPath $script:SignaturePath -Raw -Encoding UTF8
+    }
     $db = $raw | ConvertFrom-Json
     if ($null -eq $db.schemaVersion -or $db.schemaVersion -ne 1) {
         throw 'Unsupported signature database schema.'
     }
     if ($db.family -ne 'DoomsDay') { throw 'Signature database family must be DoomsDay.' }
+    $ids=@{}
     foreach ($sig in (ConvertTo-SafeArray $db.signatures)) {
         foreach ($required in @('ID','Type','Value','Source','Version','Confidence','Specificity','LastUpdated')) {
             if ($null -eq $sig.PSObject.Properties[$required] -or [string]::IsNullOrWhiteSpace([string]$sig.$required)) {
                 throw "Invalid signature: required field '$required' is missing."
             }
+        }
+        if ($ids.ContainsKey([string]$sig.ID)) { throw 'Duplicate signature ID.' }; $ids[[string]$sig.ID]=$true
+        if ($sig.Type -notin @('SHA256','Class','Package','Resource','Manifest','ModId','OriginalFilename','String','ByteSequence','StructuralFingerprint','EmbeddedNative','LoaderIndicator','RuntimeIndicator')) { throw "Unsupported signature type: $($sig.Type)" }
+        if ($sig.Specificity -notin @('Low','Medium','High','VeryHigh','Verified') -or [int]$sig.Confidence -lt 0 -or [int]$sig.Confidence -gt 100) { throw 'Invalid signature weight/specificity.' }
+        if ($sig.PSObject.Properties['Verified'] -and $sig.Verified -isnot [bool]) { throw 'Verified must be a JSON boolean.' }
+        if ($sig.PSObject.Properties['Enabled'] -and $sig.Enabled -isnot [bool]) { throw 'Enabled must be a JSON boolean.' }
+        if ($sig.Type -in @('SHA256','StructuralFingerprint') -and $sig.Value -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Invalid SHA-256 fingerprint.' }
+        if ($sig.Type -eq 'ByteSequence' -and ($sig.Value -notmatch '^(?:[A-Fa-f0-9]{2}\s*)+$' -or $sig.Value.Length -gt 131072)) { throw 'Invalid byte sequence.' }
+        if ($sig.PSObject.Properties['Verified'] -and $sig.Verified) {
+            if ($sig.PSObject.Properties['MatchMode'] -and $sig.MatchMode -in @('Regex','Wildcard')) { throw 'Verified patterns cannot use unbounded regex or wildcard matching.' }
+            if ($sig.Type -eq 'ByteSequence' -and ($sig.Value -replace '\s','').Length -lt 32) { throw 'Verified byte sequence is too short.' }
+            if ($sig.Type -ne 'SHA256' -and (-not $sig.PSObject.Properties['IndependenceGroup'] -or -not $sig.IndependenceGroup)) { throw 'Verified non-hash signatures require a reviewed independence group.' }
         }
         if ((Test-GenericIndicator ([string]$sig.Value)) -and [string]$sig.Specificity -in @('High','VeryHigh','Verified')) {
             throw "Unsafe generic high-specificity signature rejected: $($sig.ID)"
@@ -217,9 +293,9 @@ function Get-SignaturesByType {
 function Test-KnownCleanHash {
     param([string]$SHA256)
     if ([string]::IsNullOrWhiteSpace($SHA256)) { return $false }
-    return $null -ne @($script:Signatures.knownCleanHashes | Where-Object {
+    return @($script:Signatures.knownCleanHashes | Where-Object {
         [string]$_.SHA256 -eq $SHA256
-    })[0]
+    }).Count -gt 0
 }
 
 function Get-StringSha256 {
@@ -357,6 +433,135 @@ function Read-ZipEntryText {
     finally { $reader.Dispose(); $stream.Dispose() }
 }
 
+function Read-ContentInspection {
+    param([IO.Stream]$Stream, [object[]]$Signatures = @(), [long]$MaximumBytes = [long]::MaxValue,
+        [switch]$Capture, [switch]$CaptureContainers, $Budget)
+    $encoding = [Text.Encoding]::GetEncoding(28591)
+    $patterns = @()
+    $overlap = 0
+    foreach ($signature in $Signatures) {
+        $needles = @()
+        if ($signature.Type -eq 'ByteSequence') { $needles += ,(Convert-HexToBytes $signature.Value) }
+        else {
+            $needles += ,[Text.Encoding]::UTF8.GetBytes([string]$signature.Value)
+            $needles += ,[Text.Encoding]::Unicode.GetBytes([string]$signature.Value)
+        }
+        foreach ($needle in $needles) {
+            if ($needle.Length -eq 0 -or $needle.Length -gt 65536) { throw 'Content signature length is outside the safe range.' }
+            $patterns += [pscustomobject]@{ Signature=$signature; Text=$encoding.GetString($needle) }
+            $overlap = [Math]::Max($overlap, $needle.Length - 1)
+        }
+    }
+    $found = @{}
+    $tail = ''
+    $buffer = New-Object byte[] 65536
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $memory = $null
+    $prefix = [IO.MemoryStream]::new()
+    $total = 0L
+    $actualType = 'Unknown'
+    try {
+        while (($count = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $total += $count
+            if ($total -gt $MaximumBytes) { throw [IO.InvalidDataException]::new('Decompressed stream exceeded its declared/safe length.') }
+            if ($null -ne $Budget) {
+                $Budget.Bytes += $count
+                if ($Budget.Bytes -gt $script:Limits.MaximumDecompressedBytes) { throw [IO.InvalidDataException]::new('ZIP cumulative decompressed-size safety limit exceeded.') }
+            }
+            if ($prefix.Length -lt 8) { $prefix.Write($buffer,0,[Math]::Min($count,8-[int]$prefix.Length)) }
+            if ($total -eq $count) {
+                $magic = Get-MagicInfoFromStream $prefix ''
+                $actualType = $magic.ActualType
+                if ($Capture -or ($CaptureContainers -and $actualType -in @('Java Archive / ZIP','Java Class'))) { $memory = [IO.MemoryStream]::new() }
+            }
+            if ($null -ne $memory) {
+                if ($total -le $script:Limits.MaximumNestedEntryBytes) { $memory.Write($buffer,0,$count) }
+                else { $memory.Dispose(); $memory = $null }
+            }
+            [void]$sha.TransformBlock($buffer,0,$count,$null,0)
+            if ($patterns.Count -gt 0) {
+                $text = $tail + $encoding.GetString($buffer,0,$count)
+                foreach ($pattern in $patterns) {
+                    if (-not $found.ContainsKey($pattern.Signature.ID) -and $text.IndexOf($pattern.Text,[StringComparison]::Ordinal) -ge 0) { $found[$pattern.Signature.ID] = $pattern.Signature }
+                }
+                $tail = if ($text.Length -gt $overlap) { $text.Substring($text.Length-$overlap) } else { $text }
+            }
+        }
+        [void]$sha.TransformFinalBlock([byte[]]@(),0,0)
+        return [pscustomobject]@{
+            SHA256=([BitConverter]::ToString($sha.Hash)).Replace('-',''); Length=$total
+            ActualType=$actualType; Matches=@($found.Values); Bytes=$(if ($null -ne $memory) { ,$memory.ToArray() } else { $null })
+        }
+    } finally { $sha.Dispose(); $prefix.Dispose(); if ($null -ne $memory) { $memory.Dispose() } }
+}
+
+function Read-ClassU2 {
+    param([IO.BinaryReader]$Reader)
+    return (([int]$Reader.ReadByte() -shl 8) -bor [int]$Reader.ReadByte())
+}
+
+function Read-ClassU4 {
+    param([IO.BinaryReader]$Reader)
+    return (([long](Read-ClassU2 $Reader) -shl 16) -bor [long](Read-ClassU2 $Reader))
+}
+
+function Read-JavaClassIndex {
+    param([byte[]]$Bytes)
+    $memory = [IO.MemoryStream]::new($Bytes,$false)
+    $reader = [IO.BinaryReader]::new($memory)
+    try {
+        if ((Read-ClassU4 $reader) -ne 3405691582L) { throw 'Invalid Java class magic.' }
+        $minor = Read-ClassU2 $reader; $major = Read-ClassU2 $reader
+        $count = Read-ClassU2 $reader
+        $pool = New-Object object[] $count
+        $classes = @{}
+        $tags = @{}
+        for ($i=1; $i -lt $count; $i++) {
+            $tag = [int]$reader.ReadByte()
+            if (-not $tags.ContainsKey($tag)) { $tags[$tag]=0 }; $tags[$tag]++
+            switch ($tag) {
+                1 { $length=Read-ClassU2 $reader; $textBytes=$reader.ReadBytes($length); if ($textBytes.Length -ne $length) { throw 'Truncated constant pool UTF8.' }; $pool[$i]=[Text.Encoding]::UTF8.GetString($textBytes) }
+                7 { $classes[$i]=Read-ClassU2 $reader }
+                { $_ -in @(3,4,9,10,11,12,17,18) } { if ($reader.ReadBytes(4).Length -ne 4) { throw 'Truncated constant pool.' } }
+                { $_ -in @(5,6) } { if ($reader.ReadBytes(8).Length -ne 8) { throw 'Truncated constant pool.' }; $i++ }
+                { $_ -in @(8,16,19,20) } { [void](Read-ClassU2 $reader) }
+                15 { [void]$reader.ReadByte(); [void](Read-ClassU2 $reader) }
+                default { throw "Unsupported Java constant-pool tag: $tag" }
+            }
+        }
+        $flags=Read-ClassU2 $reader; $thisClass=Read-ClassU2 $reader; $superClass=Read-ClassU2 $reader
+        $interfaceCount=Read-ClassU2 $reader
+        for ($i=0; $i -lt $interfaceCount; $i++) { [void](Read-ClassU2 $reader) }
+        $shape = [Collections.Generic.List[string]]::new()
+        $shape.Add("v=$major;flags=$flags;interfaces=$interfaceCount")
+        foreach ($kind in @('field','method')) {
+            $members=Read-ClassU2 $reader
+            $shape.Add("$kind-count=$members")
+            for ($i=0; $i -lt $members; $i++) {
+                $memberFlags=Read-ClassU2 $reader; [void](Read-ClassU2 $reader); $descriptorIndex=Read-ClassU2 $reader
+                if ($descriptorIndex -ge $pool.Length) { throw 'Invalid member descriptor index.' }
+                $descriptor=([string]$pool[$descriptorIndex]) -replace 'L[^;]+;', 'LObject;'
+                $shape.Add("$kind=$memberFlags;$descriptor")
+                $attributes=Read-ClassU2 $reader
+                for ($j=0; $j -lt $attributes; $j++) {
+                    [void](Read-ClassU2 $reader); $length=Read-ClassU4 $reader
+                    if ($length -gt ($memory.Length-$memory.Position)) { throw 'Truncated member attribute.' }
+                    [void]$memory.Seek($length,[IO.SeekOrigin]::Current)
+                }
+            }
+        }
+        $attributes=Read-ClassU2 $reader
+        for ($j=0; $j -lt $attributes; $j++) {
+            [void](Read-ClassU2 $reader); $length=Read-ClassU4 $reader
+            if ($length -gt ($memory.Length-$memory.Position)) { throw 'Truncated class attribute.' }
+            [void]$memory.Seek($length,[IO.SeekOrigin]::Current)
+        }
+        if ($memory.Position -ne $memory.Length -or -not $classes.ContainsKey($thisClass)) { throw 'Invalid class layout.' }
+        $references = @($classes.Values | ForEach-Object { if ($_ -lt $pool.Length) { [string]$pool[$_] } } | Sort-Object -Unique)
+        return [pscustomobject]@{ Name=[string]$pool[$classes[$thisClass]]; MajorVersion=$major; References=$references; Shape=(Get-StringSha256 (@($shape | Sort-Object) -join "`n")) }
+    } finally { $reader.Dispose(); $memory.Dispose() }
+}
+
 function Get-ManifestAttributes {
     param([string]$Text)
     $result = [ordered]@{}
@@ -375,7 +580,7 @@ function Get-ManifestAttributes {
 function Add-SignatureMatch {
     param([Collections.ArrayList]$Matches, $Signature, [string]$Location, [string]$Observed)
     if (Test-GenericIndicator ([string]$Signature.Value)) { return }
-    if ($null -eq @($Matches | Where-Object { $_.ID -eq $Signature.ID -and $_.Location -eq $Location })[0]) {
+    if (@($Matches | Where-Object { $_.ID -eq $Signature.ID -and $_.Location -eq $Location }).Count -eq 0) {
         [void]$Matches.Add([pscustomobject][ordered]@{
             ID = [string]$Signature.ID
             Type = [string]$Signature.Type
@@ -385,142 +590,157 @@ function Add-SignatureMatch {
             Source = [string]$Signature.Source
             Location = $Location
             Observed = $Observed
+            Verified = ($Signature.PSObject.Properties['Verified'] -and $Signature.Verified -is [bool] -and $Signature.Verified)
+            IndependenceGroup = $(if ($Signature.PSObject.Properties['IndependenceGroup']) { [string]$Signature.IndependenceGroup } else { '' })
+            EvidenceContainer = $(if ($Location.LastIndexOf('!/') -gt 0) { $Location.Substring(0,$Location.LastIndexOf('!/')) } else { $Location })
         })
     }
 }
 
 function Inspect-ZipStream {
-    param(
-        [Parameter(Mandatory)][System.IO.Stream]$Stream,
-        [Parameter(Mandatory)][string]$DisplayPath,
-        [int]$Depth = 0,
-        $State
-    )
+    param([Parameter(Mandatory)][IO.Stream]$Stream, [Parameter(Mandatory)][string]$DisplayPath, [int]$Depth=0, $State, $Budget)
+    if ($null -eq $Budget) { $Budget=[pscustomobject]@{ Bytes=0L; Entries=0L } }
     $result = [pscustomobject][ordered]@{
-        DisplayPath = $DisplayPath
-        Depth = $Depth
-        EntryCount = 0
-        ClassCount = 0
-        Classes = [System.Collections.ArrayList]::new()
-        Packages = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        Resources = [System.Collections.ArrayList]::new()
-        Embedded = [System.Collections.ArrayList]::new()
-        Metadata = [ordered]@{}
-        Manifest = [ordered]@{}
-        StructuralFingerprint = ''
-        Matches = [System.Collections.ArrayList]::new()
-        AllEntriesScanned = $false
-        SecurityLimitHit = $false
+        DisplayPath=$DisplayPath; Depth=$Depth; EntryCount=0; ClassCount=0; ClassesAnalyzed=0
+        Classes=[Collections.ArrayList]::new(); Packages=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        Resources=[Collections.ArrayList]::new(); Embedded=[Collections.ArrayList]::new()
+        Metadata=[ordered]@{}; Manifest=[ordered]@{}; StructuralFingerprint=''; ContentFingerprint=''; ClassShapeFingerprint=''
+        ClassRelationships=[Collections.ArrayList]::new(); EntryHashes=[Collections.ArrayList]::new()
+        Matches=[Collections.ArrayList]::new(); AllEntriesScanned=$false; SecurityLimitHit=$false
     }
-    if ($Depth -gt $script:Limits.MaximumRecursion) { $result.SecurityLimitHit = $true; return $result }
-    if ($Stream.CanSeek) { $Stream.Position = 0 }
-    $archive = [IO.Compression.ZipArchive]::new($Stream, [IO.Compression.ZipArchiveMode]::Read, $true)
+    if ($Depth -gt $script:Limits.MaximumRecursion) { $result.SecurityLimitHit=$true; return $result }
+    if ($Stream.CanSeek) { $Stream.Position=0 }
+    $archive=[IO.Compression.ZipArchive]::new($Stream,[IO.Compression.ZipArchiveMode]::Read,$true)
+    $shapes=[Collections.Generic.List[string]]::new()
     try {
-        $entries = @($archive.Entries)
-        $result.EntryCount = $entries.Count
-        if ($entries.Count -gt $script:Limits.MaximumEntryCount) { throw [IO.InvalidDataException]::new('ZIP entry-count safety limit exceeded.') }
-        $totalExpanded = 0L
+        $entries=@($archive.Entries)
+        $result.EntryCount=$entries.Count
+        $Budget.Entries += $entries.Count
+        if ($Budget.Entries -gt $script:Limits.MaximumEntryCount) { throw [IO.InvalidDataException]::new('ZIP cumulative entry-count safety limit exceeded.') }
+        $declared=0L
         foreach ($entry in $entries) {
-            $totalExpanded += [long]$entry.Length
-            if ($totalExpanded -gt $script:Limits.MaximumDecompressedBytes) { throw [IO.InvalidDataException]::new('ZIP decompressed-size safety limit exceeded.') }
-            if ($entry.CompressedLength -gt 0 -and $entry.Length -gt 1048576) {
-                $ratio = [double]$entry.Length / [double]$entry.CompressedLength
-                if ($ratio -gt $script:Limits.MaximumCompressionRatio) { throw [IO.InvalidDataException]::new('ZIP compression-ratio safety limit exceeded.') }
-            }
+            $declared += [long]$entry.Length
+            if ($declared -gt $script:Limits.MaximumDecompressedBytes) { throw [IO.InvalidDataException]::new('ZIP decompressed-size safety limit exceeded.') }
+            if ($entry.Length -gt 1048576 -and ($entry.CompressedLength -eq 0 -or ([double]$entry.Length/[Math]::Max(1,$entry.CompressedLength)) -gt $script:Limits.MaximumCompressionRatio)) { throw [IO.InvalidDataException]::new('ZIP compression-ratio safety limit exceeded.') }
         }
-
-        $classSigs = Get-SignaturesByType @('Class')
-        $packageSigs = Get-SignaturesByType @('Package')
-        $resourceSigs = Get-SignaturesByType @('Resource','EmbeddedNative')
-        $manifestSigs = Get-SignaturesByType @('Manifest','ModId','OriginalFilename','LoaderIndicator')
-        $contentSigs = Get-SignaturesByType @('String','ByteSequence')
-        $classIndex = 0
+        $classSigs=@(Get-SignaturesByType @('Class'))
+        $packageSigs=@(Get-SignaturesByType @('Package'))
+        $resourceSigs=@(Get-SignaturesByType @('Resource','EmbeddedNative'))
+        $metadataSigs=@(Get-SignaturesByType @('Manifest','ModId','LoaderIndicator'))
+        $contentSigs=@(Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))
+        $hashSigs=@(Get-SignaturesByType @('SHA256'))
         foreach ($entry in $entries) {
-            $name = $entry.FullName.Replace('\','/')
-            if ([string]::IsNullOrEmpty($name)) { continue }
+            $name=$entry.FullName.Replace('\','/')
+            if ($script:ProgressTotal -gt 0) { Write-ScanProgress -Current $script:ProgressCurrent -Total $script:ProgressTotal -Status ("Archive entries: {0:N0}; classes analyzed: {1:N0}" -f $entries.Count,$result.ClassesAnalyzed) }
+            if (-not $name -or $name.EndsWith('/')) { continue }
+            $location="$DisplayPath!/$name"
             [void]$result.Resources.Add($name)
-            if ($name.EndsWith('.class', [StringComparison]::OrdinalIgnoreCase)) {
-                $classIndex++
-                $className = $name.Substring(0, $name.Length - 6).Replace('/','.')
-                [void]$result.Classes.Add($className)
-                $slash = $name.LastIndexOf('/')
-                if ($slash -gt 0) {
-                    $pkg = $name.Substring(0, $slash).Replace('/','.')
-                    if (-not $result.Packages.Contains($pkg)) { [void]$result.Packages.Add($pkg) }
-                }
-                foreach ($sig in $classSigs) { if (Test-TextMatch $className $sig) { Add-SignatureMatch $result.Matches $sig $name $className } }
-                foreach ($sig in $packageSigs) {
-                    if ($slash -gt 0 -and (Test-TextMatch $pkg $sig)) { Add-SignatureMatch $result.Matches $sig $name $pkg }
-                }
-                if ($contentSigs.Count -gt 0) {
-                    $entryStream = $entry.Open()
-                    try {
-                        foreach ($sig in $contentSigs) {
-                            $needle = if ([string]$sig.Type -eq 'ByteSequence') { Convert-HexToBytes ([string]$sig.Value) } else { [Text.Encoding]::UTF8.GetBytes([string]$sig.Value) }
-                            if (Test-StreamContainsBytes $entryStream $needle) { Add-SignatureMatch $result.Matches $sig $name '[byte content match]' }
-                        }
-                    } finally { $entryStream.Dispose() }
-                }
-            }
-            foreach ($sig in $resourceSigs) { if (Test-TextMatch $name $sig) { Add-SignatureMatch $result.Matches $sig $name $name } }
-
-            if ($name -match '(?i)^(META-INF/MANIFEST\.MF|mcmod\.info|META-INF/mods\.toml|fabric\.mod\.json|quilt\.mod\.json|plugin\.yml)$' -or $name -match '(?i)^META-INF/services/') {
+            $isMetadata=$name -match '(?i)^(META-INF/MANIFEST\.MF|mcmod\.info|META-INF/(neo)?mods\.toml|fabric\.mod\.json|quilt\.mod\.json|plugin\.yml)$|^META-INF/services/'
+            $isClass=$name.EndsWith('.class',[StringComparison]::OrdinalIgnoreCase)
+            if ($isClass) { $result.ClassCount++ }
+            $entryStream=$entry.Open()
+            try { $content=Read-ContentInspection -Stream $entryStream -Signatures $contentSigs -MaximumBytes $entry.Length -Capture:$isMetadata -CaptureContainers -Budget $Budget }
+            finally { $entryStream.Dispose() }
+            if ($content.Length -ne $entry.Length) { throw [IO.InvalidDataException]::new("ZIP entry length mismatch: $name") }
+            foreach ($sig in $content.Matches) { Add-SignatureMatch $result.Matches $sig $location '[byte content match]' }
+            foreach ($sig in $hashSigs) { if ($sig.Value -eq $content.SHA256) { Add-SignatureMatch $result.Matches $sig $location $content.SHA256 } }
+            [void]$result.EntryHashes.Add([pscustomobject]@{ Path=$location; SHA256=$content.SHA256; Length=$content.Length; ActualType=$content.ActualType })
+            foreach ($sig in $resourceSigs) { if (Test-TextMatch $name $sig) { Add-SignatureMatch $result.Matches $sig $location $name } }
+            if ($isClass -or $content.ActualType -eq 'Java Class') {
+                if (-not $isClass) { $result.ClassCount++ }
                 try {
-                    $text = Read-ZipEntryText $entry $script:Limits.MaximumMetadataBytes
-                    $result.Metadata[$name] = $text
-                    if ($name -ieq 'META-INF/MANIFEST.MF') { $result.Manifest = Get-ManifestAttributes $text }
-                    foreach ($sig in $manifestSigs) { if (Test-TextMatch $text $sig) { Add-SignatureMatch $result.Matches $sig $name '[metadata match]' } }
-                } catch { if ($State) { Add-ScanWarning $State 'JAR' $_.Exception.Message $DisplayPath } }
-            }
-
-            if ($name -match '(?i)\.(jar|zip)$') {
-                [void]$result.Embedded.Add($name)
-                if ($Depth -lt $script:Limits.MaximumRecursion) {
-                    if ($entry.Length -gt $script:Limits.MaximumNestedEntryBytes) {
-                        if ($State) { $State.FilesSkipped++; Add-ScanWarning $State 'NESTED JAR' 'Nested archive exceeds the bounded in-memory inspection limit.' "$DisplayPath!/$name" }
-                    } else {
-                        $nestedSource = $entry.Open(); $memory = [IO.MemoryStream]::new()
-                        try {
-                            $nestedSource.CopyTo($memory); $memory.Position = 0
-                            $nested = Inspect-ZipStream -Stream $memory -DisplayPath "$DisplayPath!/$name" -Depth ($Depth + 1) -State $State
-                            foreach ($match in $nested.Matches) { [void]$result.Matches.Add($match) }
-                            foreach ($embeddedName in $nested.Embedded) { [void]$result.Embedded.Add("$name!/$embeddedName") }
-                            if (-not $nested.AllEntriesScanned) { $result.SecurityLimitHit = $true }
-                        } finally { $nestedSource.Dispose(); $memory.Dispose() }
-                    }
+                    if ($null -eq $content.Bytes) { throw 'Class exceeds in-memory parsing safety budget.' }
+                    $class=Read-JavaClassIndex $content.Bytes
+                    $className=$class.Name.Replace('/','.')
+                    [void]$result.Classes.Add($className)
+                    $result.ClassesAnalyzed++
+                    $shapes.Add($class.Shape)
+                    [void]$result.ClassRelationships.Add([pscustomobject]@{ Class=$className; References=$class.References })
+                    $dot=$className.LastIndexOf('.')
+                    $package=if ($dot -gt 0) { $className.Substring(0,$dot) } else { '' }
+                    if ($package) { [void]$result.Packages.Add($package) }
+                    foreach ($sig in $classSigs) { if (Test-TextMatch $className $sig) { Add-SignatureMatch $result.Matches $sig $location $className } }
+                    foreach ($sig in $packageSigs) { if ($package -and (Test-TextMatch $package $sig)) { Add-SignatureMatch $result.Matches $sig $location $package } }
+                } catch {
+                    $result.SecurityLimitHit=$true
+                    if ($null -ne $State) { Add-ScanWarning $State 'CLASS' $_.Exception.Message $location }
                 }
-            } elseif ($name -match '(?i)\.(dll|so|dylib)$') {
-                [void]$result.Embedded.Add($name)
             }
+            if ($isMetadata) {
+                if ($entry.Length -gt $script:Limits.MaximumMetadataBytes -or $null -eq $content.Bytes) {
+                    $result.SecurityLimitHit=$true
+                    if ($null -ne $State) { Add-ScanWarning $State 'METADATA' 'Metadata parse safety limit reached; byte content was still inspected.' $location }
+                } else {
+                    $metadataText=[Text.Encoding]::UTF8.GetString($content.Bytes)
+                    $result.Metadata[$name]=$metadataText
+                    if ($name -ieq 'META-INF/MANIFEST.MF') { $result.Manifest=Get-ManifestAttributes $metadataText }
+                    foreach ($sig in $metadataSigs) { if (Test-TextMatch $metadataText $sig) { Add-SignatureMatch $result.Matches $sig $location '[metadata match]' } }
+                }
+            }
+            if ($content.ActualType -eq 'Java Archive / ZIP' -or $name -match '(?i)\.(jar|zip)$') {
+                [void]$result.Embedded.Add($location)
+                if ($Depth -ge $script:Limits.MaximumRecursion -or $null -eq $content.Bytes) {
+                    $result.SecurityLimitHit=$true
+                    if ($null -ne $State) { Add-ScanWarning $State 'NESTED JAR' 'Recursion or memory safety limit reached; nested contents remain unanalyzed.' $location }
+                } else {
+                    $nestedStream=[IO.MemoryStream]::new([byte[]]$content.Bytes,$false)
+                    try {
+                        $nested=Inspect-ZipStream $nestedStream $location ($Depth+1) $State $Budget
+                        foreach ($match in $nested.Matches) { [void]$result.Matches.Add($match) }
+                        foreach ($nestedName in $nested.Embedded) { [void]$result.Embedded.Add($nestedName) }
+                        if (-not $nested.AllEntriesScanned) { $result.SecurityLimitHit=$true }
+                    } finally { $nestedStream.Dispose() }
+                }
+            } elseif ($content.ActualType -eq 'Windows PE' -or $name -match '(?i)\.(dll|so|dylib)$') { [void]$result.Embedded.Add($location) }
         }
-        $result.ClassCount = $classIndex
-        $structure = (@($result.Resources | Sort-Object -Unique) -join "`n") + "`n--manifest-keys--`n" + (@($result.Manifest.Keys | Sort-Object) -join "`n")
-        $result.StructuralFingerprint = Get-StringSha256 $structure
-        foreach ($sig in (Get-SignaturesByType @('StructuralFingerprint'))) {
-            if ([string]$sig.Value -eq $result.StructuralFingerprint) { Add-SignatureMatch $result.Matches $sig $DisplayPath $result.StructuralFingerprint }
+        $structure=(@($result.Resources | Sort-Object -Unique) -join "|") + '|manifest|' + (@($result.Manifest.Keys | Sort-Object) -join '|')
+        $result.StructuralFingerprint=Get-StringSha256 $structure
+        $result.ContentFingerprint=Get-StringSha256 (@($result.EntryHashes | ForEach-Object { $_.SHA256 } | Sort-Object) -join '|')
+        $result.ClassShapeFingerprint=Get-StringSha256 (@($shapes | Sort-Object) -join '|')
+        foreach ($sig in @(Get-SignaturesByType @('StructuralFingerprint'))) {
+            $observed=$result.StructuralFingerprint
+            if ($sig.PSObject.Properties['FingerprintKind']) {
+                if ($sig.FingerprintKind -eq 'Content') { $observed=$result.ContentFingerprint }
+                elseif ($sig.FingerprintKind -eq 'ClassShape') { $observed=$result.ClassShapeFingerprint }
+            }
+            if ($sig.Value -eq $observed) { Add-SignatureMatch $result.Matches $sig $DisplayPath $observed }
         }
-        $result.AllEntriesScanned = -not $result.SecurityLimitHit
-        if ($State) { $State.TotalIndexesExtracted += $entries.Count }
+        $result.AllEntriesScanned=-not $result.SecurityLimitHit
+        if ($null -ne $State) { $State.TotalIndexesExtracted += $entries.Count }
         return $result
-    } catch {
-        if ($_.Exception.Message -match 'safety limit|bounded') { $result.SecurityLimitHit = $true }
-        throw
     } finally { $archive.Dispose() }
 }
-
 function Get-CategoryForFile {
     param([string]$Extension, [string]$ActualType, $JarAnalysis, [string]$Source = 'FILE')
     if ($Source -eq 'ADS') { return 'ADS_PAYLOAD' }
     if ($null -ne $JarAnalysis) {
         if ($JarAnalysis.Manifest.Contains('Premain-Class') -or $JarAnalysis.Manifest.Contains('Agent-Class') -or $JarAnalysis.Manifest.Contains('Launcher-Agent-Class')) { return 'JAVA_AGENT' }
-        return 'MOD'
+        if (@($JarAnalysis.Metadata.Keys | Where-Object { $_ -match '(?i)mcmod\.info|mods\.toml|fabric\.mod\.json|quilt\.mod\.json' }).Count -gt 0) { return 'MOD' }
+        if ($JarAnalysis.Manifest.Contains('Main-Class')) { return 'LOADER' }
+        return 'UNKNOWN'
     }
     switch ($Extension.ToLowerInvariant()) {
         '.dll' { return 'NATIVE_DLL' }
-        '.exe' { return 'LOADER' }
+        '.exe' { return 'UNKNOWN' }
         '.class' { return 'UNKNOWN' }
-        default { if ($ActualType -eq 'Windows PE') { return 'LOADER' }; return 'UNKNOWN' }
+        default { return 'UNKNOWN' }
     }
+}
+
+function Get-EvasionContextIndicators {
+    param([string]$LiteralPath, [string]$ActualType)
+    if ($LiteralPath -eq (Join-Path $script:ProjectRoot 'DoomsDayFinder.ps1')) { return @() }
+    if ($ActualType -ne 'Windows PE' -and [IO.Path]::GetExtension($LiteralPath) -notin @('.ps1','.bat','.cmd','.vbs','.py')) { return @() }
+    $indicators=@(
+        [pscustomobject]@{ ID='JRE_USAGE_PATH'; Type='String'; Value='.oracle_jre_usage' },
+        [pscustomobject]@{ ID='JAVA_PROCESS_NAME'; Type='String'; Value='javaw.exe' },
+        [pscustomobject]@{ ID='MEMORY_WRITE_API'; Type='String'; Value='WriteProcessMemory' },
+        [pscustomobject]@{ ID='PYTHON_MEMORY_WRITE'; Type='String'; Value='write_bytes' },
+        [pscustomobject]@{ ID='MEMORY_QUERY_API'; Type='String'; Value='VirtualQueryEx' }
+    )
+    $stream=[IO.File]::Open($LiteralPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try { $content=Read-ContentInspection $stream $indicators; return @($content.Matches | Select-Object -ExpandProperty ID) }
+    finally { $stream.Dispose() }
 }
 
 function Get-ScoreForMatches {
@@ -553,15 +773,19 @@ function Get-ScoreForMatches {
 function Get-Decision {
     param([object[]]$Matches, [int]$Score, [bool]$KnownClean, [bool]$ContentAvailable = $true)
     $unique = @($Matches | Sort-Object ID -Unique)
-    $hashMatch = @($unique | Where-Object { $_.Type -eq 'SHA256' -and $_.Specificity -in @('High','VeryHigh','Verified') }).Count -gt 0
-    $strong = @($unique | Where-Object { $_.Specificity -in @('High','VeryHigh','Verified') -and $_.Type -ne 'StructuralFingerprint' })
-    $strongTypes = @($strong.Type | Sort-Object -Unique)
+    $hashMatch = @($unique | Where-Object { $_.Type -eq 'SHA256' -and $_.PSObject.Properties['Verified'] -and $_.Verified -eq $true }).Count -gt 0
+    $strong = @($unique | Where-Object { $_.Specificity -in @('High','VeryHigh','Verified') -and $_.Type -notin @('StructuralFingerprint','OriginalFilename') })
     if ($KnownClean -and ($unique.Count -gt 0)) { return [pscustomobject]@{ Verdict='INCONCLUSIVE'; Verification='CONFLICTING'; EligibleForDetected=$false; Reason='Known-clean hash conflicts with signature evidence.' } }
     if (-not $ContentAvailable) { return [pscustomobject]@{ Verdict='REVIEW'; Verification='UNVERIFIED'; EligibleForDetected=$false; Reason='File content was unavailable.' } }
     if ($hashMatch) { return [pscustomobject]@{ Verdict='DETECTED'; Verification='PENDING'; EligibleForDetected=$true; Reason='Verified DoomsDay SHA-256 signature matched.' } }
-    if ($strong.Count -ge 2 -and $strongTypes.Count -ge 2) { return [pscustomobject]@{ Verdict='DETECTED'; Verification='PENDING'; EligibleForDetected=$true; Reason='Multiple independent high-specificity DoomsDay indicators matched.' } }
-    if ($strong.Count -ge 2 -or $Score -ge 80) { return [pscustomobject]@{ Verdict='HIGH CONFIDENCE'; Verification='PROBABLE'; EligibleForDetected=$false; Reason='Strong indicators require additional independent verification.' } }
-    if ($unique.Count -gt 0 -or $Score -ge 40) { return [pscustomobject]@{ Verdict='SUSPICIOUS'; Verification='UNVERIFIED'; EligibleForDetected=$false; Reason='DoomsDay-related indicators require manual review.' } }
+    $independent=$false
+    foreach ($container in @($strong | Where-Object { $_.PSObject.Properties['EvidenceContainer'] } | Group-Object EvidenceContainer)) {
+        $containerGroups=@($container.Group | Where-Object { $_.PSObject.Properties['Verified'] -and $_.Verified -eq $true -and $_.PSObject.Properties['IndependenceGroup'] -and $_.IndependenceGroup } | Select-Object -ExpandProperty IndependenceGroup -Unique)
+        if ($containerGroups.Count -ge 2) { $independent=$true }
+    }
+    if ($independent) { return [pscustomobject]@{ Verdict='DETECTED'; Verification='PENDING'; EligibleForDetected=$true; Reason='Multiple verified independent high-specificity DoomsDay indicators matched in the same artifact.' } }
+    if ($strong.Count -ge 2 -or ($unique.Count -gt 0 -and $Score -ge 80)) { return [pscustomobject]@{ Verdict='HIGH CONFIDENCE'; Verification='PROBABLE'; EligibleForDetected=$false; Reason='Strong indicators require additional independent verification.' } }
+    if ($unique.Count -gt 0) { return [pscustomobject]@{ Verdict='SUSPICIOUS'; Verification='UNVERIFIED'; EligibleForDetected=$false; Reason='DoomsDay-related indicators require manual review.' } }
     return [pscustomobject]@{ Verdict='INFO'; Verification='UNVERIFIED'; EligibleForDetected=$false; Reason='No verified DoomsDay-specific content indicators.' }
 }
 
@@ -574,7 +798,7 @@ function New-Finding {
         [string[]]$ExecutionEvidence = @(), [string[]]$EvidenceSources = @(), [object[]]$Evidence = @(),
         [int]$Confidence = 0, [string]$VerificationStatus = 'UNVERIFIED', [string]$Verdict = 'INFO',
         [string[]]$DetectionReasons = @(), [string]$Source = 'FILE', [bool]$ExtensionMismatch = $false,
-        [string]$MagicBytes = ''
+        [string]$MagicBytes = '', [string[]]$BypassIndicators = @()
     )
     [pscustomobject][ordered]@{
         FindingId = 'DDF-' + [guid]::NewGuid().ToString('N').Substring(0,12).ToUpperInvariant()
@@ -586,6 +810,7 @@ function New-Finding {
         ActualFileType = $ActualFileType
         ExtensionMismatch = $ExtensionMismatch
         MagicBytes = $MagicBytes
+        BypassIndicators = @($BypassIndicators)
         Category = $Category
         Status = $Status
         LoaderType = $LoaderType
@@ -609,48 +834,42 @@ function New-Finding {
 
 function Confirm-FileFinding {
     param([string]$LiteralPath, $InitialFinding, [string[]]$InitialMatchIds, $State)
-    Write-Stage 'VERIFY' "Second inspection: $LiteralPath"
+    Write-Stage 'VERIFY' 'Reopening candidate and reproducing hash plus signature matches...'
+    $stream=$null
     try {
-        $secondHash = Get-CachedFileSha256 -LiteralPath $LiteralPath -BypassCache
-        if ($secondHash -ne $InitialFinding.SHA256) { return [pscustomobject]@{ Verified=$false; Status='CONFLICTING'; Reason='SHA-256 changed between inspections.' } }
-        $magic = Get-MagicInfo -LiteralPath $LiteralPath
-        $secondIds = [System.Collections.ArrayList]::new()
-        foreach ($sig in (Get-SignaturesByType @('SHA256'))) {
-            if ([string]$sig.Value -eq $secondHash) { [void]$secondIds.Add([string]$sig.ID) }
-        }
+        $stream=[IO.File]::Open($LiteralPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $secondHash=Get-StreamSha256 $stream
+        if ($secondHash -ne $InitialFinding.SHA256) { throw 'SHA-256 changed between inspections.' }
+        $magic=Get-MagicInfoFromStream $stream ''
+        $secondIds=[Collections.Generic.HashSet[string]]::new()
+        foreach ($sig in @(Get-SignaturesByType @('SHA256'))) { if ($sig.Value -eq $secondHash -and -not (Test-GenericIndicator $sig.Value)) { [void]$secondIds.Add($sig.ID) } }
         if ($magic.ActualType -eq 'Java Archive / ZIP') {
-            $stream = [IO.File]::Open($LiteralPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
-            try {
-                $jar = Inspect-ZipStream -Stream $stream -DisplayPath $LiteralPath -State $null
-                foreach ($match in $jar.Matches) { [void]$secondIds.Add([string]$match.ID) }
-            } finally { $stream.Dispose() }
-        } elseif ($magic.ActualType -in @('Windows PE','Java Class')) {
-            $verifyStream = [IO.File]::Open($LiteralPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
-            try {
-                foreach ($sig in (Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))) {
-                    $needle = if ([string]$sig.Type -eq 'ByteSequence') { Convert-HexToBytes ([string]$sig.Value) } else { [Text.Encoding]::UTF8.GetBytes([string]$sig.Value) }
-                    if (Test-StreamContainsBytes $verifyStream $needle) { [void]$secondIds.Add([string]$sig.ID) }
-                }
-            } finally { $verifyStream.Dispose() }
+            $archive=Inspect-ZipStream -Stream $stream -DisplayPath $LiteralPath
+            if (-not $archive.AllEntriesScanned) { throw 'Second archive inspection was incomplete.' }
+            foreach ($match in $archive.Matches) { [void]$secondIds.Add($match.ID) }
+            foreach ($entry in $archive.EntryHashes) {
+                if ((Test-KnownCleanHash $entry.SHA256) -and @($archive.Matches | Where-Object { $_.Location -eq $entry.Path -or $_.Location.StartsWith($entry.Path+'!/') }).Count -gt 0) { throw 'Known-clean embedded content conflicts with signatures.' }
+            }
+        } else {
+            $stream.Position=0
+            $content=Read-ContentInspection $stream @(Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))
+            foreach ($sig in $content.Matches) { if (-not (Test-GenericIndicator $sig.Value)) { [void]$secondIds.Add($sig.ID) } }
         }
-        $a = @($InitialMatchIds | Sort-Object -Unique)
-        $b = @($secondIds | Sort-Object -Unique)
-        $missing = @($a | Where-Object { $_ -notin $b })
-        if ($missing.Count -gt 0) { return [pscustomobject]@{ Verified=$false; Status='CONFLICTING'; Reason='Signature matches were not reproducible.' } }
-        if (Test-KnownCleanHash $secondHash) { return [pscustomobject]@{ Verified=$false; Status='CONFLICTING'; Reason='Known-clean hash matched during verification.' } }
-        return [pscustomobject]@{ Verified=$true; Status='VERIFIED'; Reason='Hash and signature evidence reproduced independently.' }
+        foreach ($id in $InitialMatchIds) { if (-not $secondIds.Contains($id)) { throw 'Signature matches were not reproducible.' } }
+        if (Test-KnownCleanHash $secondHash) { throw 'Known-clean hash conflicts with signatures.' }
+        if ((Get-StreamSha256 $stream) -ne $secondHash) { throw 'Content changed during verification.' }
+        return [pscustomobject]@{ Verified=$true; Status='VERIFIED'; Reason='Independent reopen, content inspection and SHA-256 verification succeeded.' }
     } catch {
         Add-ScanWarning $State 'VERIFY' $_.Exception.Message $LiteralPath
-        return [pscustomobject]@{ Verified=$false; Status='UNVERIFIED'; Reason=$_.Exception.Message }
-    }
+        return [pscustomobject]@{ Verified=$false; Status='CONFLICTING'; Reason=$_.Exception.Message }
+    } finally { if ($null -ne $stream) { $stream.Dispose() } }
 }
-
 function Invoke-FileInspection {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$LiteralPath, $State, [string]$Source = 'FILE', [switch]$AlwaysRecord, [switch]$QuietProgress)
-    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) { throw "File not found: $LiteralPath" }
-    $item = Get-Item -LiteralPath $LiteralPath -Force
-    $inspectionKey = $item.FullName.ToLowerInvariant()
+    try { $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop; if ($item.PSIsContainer) { throw 'Candidate is not a file.' } }
+    catch { $State.CandidateFiles++; $State.FilesSkipped++; Add-ScanWarning $State 'FILE' $_.Exception.Message $LiteralPath; return $null }
+    $inspectionKey = '{0}|{1}|{2}' -f $item.FullName.ToLowerInvariant(), $item.Length, $item.LastWriteTimeUtc.Ticks
     if ($script:InspectionCache.ContainsKey($inspectionKey)) {
         $cachedFinding = $script:InspectionCache[$inspectionKey]
         if ($null -ne $cachedFinding) {
@@ -665,9 +884,9 @@ function Invoke-FileInspection {
     try {
         $magic = Get-MagicInfo -LiteralPath $item.FullName
         $sha256 = Get-CachedFileSha256 -LiteralPath $item.FullName
-        $matches = [System.Collections.ArrayList]::new()
+        $signatureMatches = [System.Collections.ArrayList]::new()
         foreach ($sig in (Get-SignaturesByType @('SHA256'))) {
-            if ([string]$sig.Value -eq $sha256) { Add-SignatureMatch $matches $sig $item.FullName $sha256 }
+            if ([string]$sig.Value -eq $sha256) { Add-SignatureMatch $signatureMatches $sig $item.FullName $sha256 }
         }
         $jar = $null
         if ($magic.ActualType -eq 'Java Archive / ZIP') {
@@ -675,52 +894,64 @@ function Invoke-FileInspection {
             $stream = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
             try { $jar = Inspect-ZipStream -Stream $stream -DisplayPath $item.FullName -State $State }
             finally { $stream.Dispose() }
-            foreach ($match in $jar.Matches) { [void]$matches.Add($match) }
+            foreach ($match in $jar.Matches) { [void]$signatureMatches.Add($match) }
             if (-not $QuietProgress) { Write-Stage 'CLASS' ("{0} / {0} classes" -f $jar.ClassCount) }
-            if (-not $jar.AllEntriesScanned) { $State.FilesSkipped++ }
-        } elseif ($magic.ActualType -in @('Windows PE','Java Class')) {
-            $contentSigs = Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator')
+            if (-not $jar.AllEntriesScanned) { $State.PartialFiles++; $State.FilesSkipped++ }
+        } else {
+            $contentSigs = @(Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))
             if ($contentSigs.Count -gt 0) {
-                $stream = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
-                try {
-                    foreach ($sig in $contentSigs) {
-                        $needle = if ([string]$sig.Type -eq 'ByteSequence') { Convert-HexToBytes ([string]$sig.Value) } else { [Text.Encoding]::UTF8.GetBytes([string]$sig.Value) }
-                        if (Test-StreamContainsBytes $stream $needle) { Add-SignatureMatch $matches $sig $item.FullName '[byte content match]' }
-                    }
-                } finally { $stream.Dispose() }
+                $stream=[IO.File]::Open($item.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+                try { $content=Read-ContentInspection -Stream $stream -Signatures $contentSigs }
+                finally { $stream.Dispose() }
+                foreach ($sig in $content.Matches) { Add-SignatureMatch $signatureMatches $sig $item.FullName '[byte content match]' }
             }
+            if ($item.Extension -in @('.jar','.zip') -and $magic.ActualType -eq 'Unknown') { throw [IO.InvalidDataException]::new('Archive extension present but no supported ZIP header; content cannot be fully analyzed.') }
         }
         $filenameMatch = $item.Name -match '(?i)dooms[ -_]?day'
-        $score = Get-ScoreForMatches -Matches @($matches) -FilenameMatch $filenameMatch -AdsCorrelation:($Source -eq 'ADS')
-        $knownClean = Test-KnownCleanHash $sha256
-        $decision = Get-Decision -Matches @($matches) -Score $score -KnownClean $knownClean
-        if ($filenameMatch -and $matches.Count -eq 0) {
+        $evasionIndicators=@(Get-EvasionContextIndicators $item.FullName $magic.ActualType)
+        $score = Get-ScoreForMatches -Matches @($signatureMatches) -FilenameMatch $filenameMatch -AdsCorrelation:($Source -eq 'ADS')
+    $knownClean = Test-KnownCleanHash $sha256
+        $decision = Get-Decision -Matches @($signatureMatches) -Score $score -KnownClean $knownClean
+        $cleanerCombination=('JRE_USAGE_PATH' -in $evasionIndicators -and 'JAVA_PROCESS_NAME' -in $evasionIndicators -and ('MEMORY_WRITE_API' -in $evasionIndicators -or 'PYTHON_MEMORY_WRITE' -in $evasionIndicators))
+        if ($cleanerCombination -and $decision.Verdict -eq 'INFO' -and -not $knownClean) {
+            $decision.Verdict='REVIEW'
+            $decision.Reason='Static memory-cleaner indicators; tool presence is not proof of execution or DoomsDay.'
+        }
+        if ($filenameMatch -and $signatureMatches.Count -eq 0 -and -not $knownClean) {
             $decision.Verdict = 'REVIEW'
             $decision.Verification = 'UNVERIFIED'
             $decision.EligibleForDetected = $false
             $decision.Reason = 'Filename-only resemblance requires manual review and cannot identify the family.'
         }
         $reasons = [System.Collections.ArrayList]::new()
-        foreach ($match in @($matches | Sort-Object ID -Unique)) { [void]$reasons.Add("$($match.Type) signature $($match.ID) matched at $($match.Location)") }
+        if ($cleanerCombination) { [void]$reasons.Add('Java target, memory-write capability and JRE usage path occur together. Manual tool review only; no DoomsDay attribution or execution inferred.') }
+        foreach ($match in @($signatureMatches | Sort-Object ID -Unique)) { [void]$reasons.Add("$($match.Type) signature $($match.ID) matched at $($match.Location)") }
         if ($filenameMatch) { [void]$reasons.Add('Filename resembles DoomsDay; filename contributes only one informational point.') }
         if ($magic.ExtensionMismatch) { [void]$reasons.Add('Displayed extension does not match file magic bytes.') }
         if ($knownClean) { [void]$reasons.Add('Known-clean hash matched; conflicting evidence protection applied.') }
         if ($reasons.Count -eq 0) { [void]$reasons.Add('No DoomsDay-specific signature matched.') }
         $category = Get-CategoryForFile -Extension $item.Extension -ActualType $magic.ActualType -JarAnalysis $jar -Source $Source
-        $finding = New-Finding -Family $(if ($matches.Count -gt 0) { 'DoomsDay' } else { 'Unknown' }) `
+        $finding = New-Finding -Family $(if ($signatureMatches.Count -gt 0) { 'DoomsDay' } else { 'Unknown' }) `
             -CurrentName $item.Name -FullPath $item.FullName -Extension $item.Extension -ActualFileType $magic.ActualType `
             -Category $category -Status $(if ($Source -eq 'ADS') { 'ADS' } else { 'CURRENT' }) -Size $item.Length -SHA256 $sha256 `
             -CreatedUtc $item.CreationTimeUtc -ModifiedUtc $item.LastWriteTimeUtc -LastAccessUtc $item.LastAccessTimeUtc `
-            -EvidenceSources @($Source) -Evidence @($matches) -Confidence $score -VerificationStatus $decision.Verification `
-            -Verdict $decision.Verdict -DetectionReasons @($reasons) -Source $Source -ExtensionMismatch $magic.ExtensionMismatch -MagicBytes $magic.MagicBytes
+            -EvidenceSources @($Source) -Evidence @($signatureMatches) -Confidence $score -VerificationStatus $decision.Verification `
+            -Verdict $decision.Verdict -DetectionReasons @($reasons) -Source $Source -ExtensionMismatch $magic.ExtensionMismatch -MagicBytes $magic.MagicBytes -BypassIndicators $evasionIndicators
 
         if ($decision.EligibleForDetected) {
-            $confirm = Confirm-FileFinding -LiteralPath $item.FullName -InitialFinding $finding -InitialMatchIds @($matches.ID) -State $State
+            $confirm = Confirm-FileFinding -LiteralPath $item.FullName -InitialFinding $finding -InitialMatchIds @($signatureMatches.ID) -State $State
             $finding.VerificationStatus = $confirm.Status
-            if ($confirm.Verified) { $finding.Verdict = 'DETECTED'; [void]$finding.DetectionReasons.Add($confirm.Reason) }
-            else { $finding.Verdict = if ($confirm.Status -eq 'CONFLICTING') { 'INCONCLUSIVE' } else { 'HIGH CONFIDENCE' }; [void]$finding.DetectionReasons.Add($confirm.Reason) }
+            if ($confirm.Verified) { $finding.Verdict = 'DETECTED'; $finding.DetectionReasons += $confirm.Reason }
+            else { $finding.Verdict = if ($confirm.Status -eq 'CONFLICTING') { 'INCONCLUSIVE' } else { 'HIGH CONFIDENCE' }; $finding.DetectionReasons += $confirm.Reason }
         }
-        $State.FilesFullyScanned++
+        $freshItem=Get-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+        if ($freshItem.Length -ne $item.Length -or $freshItem.LastWriteTimeUtc -ne $item.LastWriteTimeUtc) { throw 'File changed during inspection; retry required.' }
+        if ($null -eq $jar -or $jar.AllEntriesScanned) { $State.FilesFullyScanned++ }
+        else { $finding.Verdict='INCONCLUSIVE'; $finding.VerificationStatus='UNVERIFIED'; $finding.DetectionReasons += 'Archive parsing was incomplete.' }
+        if ($null -ne $jar) {
+            $finding | Add-Member -NotePropertyName ArchiveAnalysis -NotePropertyValue $jar
+            [void]$State.Evidence.Add([pscustomobject]@{ Source='Archive Inspection'; Path=$item.FullName; SHA256=$sha256; ClassCount=$jar.ClassCount; ClassesAnalyzed=$jar.ClassesAnalyzed; ContentFingerprint=$jar.ContentFingerprint; ClassShapeFingerprint=$jar.ClassShapeFingerprint; Complete=$jar.AllEntriesScanned })
+        }
         if ($AlwaysRecord -or $finding.Verdict -ne 'INFO' -or $filenameMatch -or $magic.ExtensionMismatch) { [void]$State.Findings.Add($finding) }
         $script:InspectionCache[$inspectionKey] = $finding
         return $finding
@@ -806,42 +1037,61 @@ function Get-MinecraftLocations {
     return @($paths | Sort-Object -Unique)
 }
 
+function Get-ReadOnlyFiles {
+    param([string[]]$Roots, $State, [switch]$Recurse)
+    $pending=[Collections.Generic.Stack[string]]::new()
+    foreach ($root in @(Get-NormalizedScanRoots $Roots)) { $pending.Push($root) }
+    while ($pending.Count -gt 0) {
+        $directory=$pending.Pop()
+        try { $children=@(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) }
+        catch { $State.FilesSkipped++; Add-ScanWarning $State 'DISCOVERY' $_.Exception.Message $directory; continue }
+        foreach ($child in $children) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $State.FilesSkipped++
+                Add-ScanWarning $State 'DISCOVERY' 'Reparse point not followed; include its target explicitly if authorized.' $child.FullName
+                continue
+            }
+            if ($child.PSIsContainer) { if ($Recurse) { $pending.Push($child.FullName) } }
+            else { $child }
+        }
+    }
+}
+
 function Get-CandidateFiles {
     param([string[]]$Roots, $State, [switch]$Full)
-    $extensions = @('.jar','.zip','.exe','.dll','.class','.dat','.tmp','.bin','.ps1','.bat','.cmd','.vbs')
-    $files = [System.Collections.ArrayList]::new()
-    foreach ($root in @(Get-NormalizedScanRoots -Roots $Roots)) {
-        Write-Stage 'COLLECT' "Discovering candidates under $root"
-        try {
-            $children = Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction SilentlyContinue
-            foreach ($file in $children) {
-                if ($file.Extension.ToLowerInvariant() -in $extensions) { [void]$files.Add($file.FullName) }
-            }
-        } catch { Add-ScanWarning $State 'DISCOVERY' $_.Exception.Message $root }
+    $extensions=@('.jar','.zip','.exe','.dll','.class','.dat','.tmp','.bin','.ps1','.bat','.cmd','.vbs','.py')
+    $files=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    Write-Stage 'COLLECT' 'Indexing files and checking magic bytes. The total is shown when enumeration finishes.'
+    foreach ($file in Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse) {
+        $State.DiscoveredFiles++
+        $candidate=$file.Extension.ToLowerInvariant() -in $extensions
+        if (-not $candidate) {
+            try { $candidate=(Get-MagicInfo $file.FullName).ActualType -in @('Java Archive / ZIP','Windows PE','Java Class') }
+            catch { $State.FilesSkipped++; Add-ScanWarning $State 'MAGIC' $_.Exception.Message $file.FullName }
+        }
+        if ($candidate) { [void]$files.Add($file.FullName) }
+        Write-ScanProgress -Activity 'Collect' -Status 'Indexing files; total pending' -Current $State.DiscoveredFiles -Total 0
     }
-    return @($files | Sort-Object -Unique)
+    Write-ScanProgress -Completed
+    return @($files | Sort-Object)
 }
 
 function Invoke-CandidateScan {
     param([string[]]$Roots, $State, [switch]$Full)
-    $files = @(Get-CandidateFiles -Roots $Roots -State $State -Full:$Full)
-    $State.CandidateFiles = 0
-    if ($files.Count -eq 0) {
-        Write-Stage 'SCAN' 'No candidate files were found in the selected locations.'
-        return
-    }
-    Write-Stage 'SCAN' ("{0} candidate files will be analyzed; progress is shown on one updating line." -f $files.Count)
-    $index = 0
-    foreach ($file in $files) {
-        $index++
-        $shortName = [IO.Path]::GetFileName($file)
-        Write-ScanProgress -Activity 'Reveal ScreenShare - file analysis' -Status ("{0:N0} / {1:N0} - {2}" -f $index, $files.Count, $shortName) -Current $index -Total $files.Count
-        Invoke-FileInspection -LiteralPath $file -State $State -QuietProgress | Out-Null
-    }
-    Write-ScanProgress -Activity 'Reveal ScreenShare - file analysis' -Completed
-    Write-Color ("[SCAN] {0:N0} / {1:N0} candidate files analyzed." -f $index, $files.Count) Magenta
+    $files=@(Get-CandidateFiles -Roots $Roots -State $State -Full:$Full)
+    if ($files.Count -eq 0) { Write-Stage 'SCAN' 'No candidate files were found in the selected locations.'; return }
+    Write-Stage 'SCAN' ("TOTAL FILES: {0:N0} | Detailed content inspection; no class-count skip." -f $files.Count)
+    $script:ProgressTotal=$files.Count
+    try {
+        for ($index=0; $index -lt $files.Count; $index++) {
+            $script:ProgressCurrent=$index
+            Write-ScanProgress -Status 'Detailed file inspection' -Current $index -Total $files.Count
+            Invoke-FileInspection -LiteralPath $files[$index] -State $State -QuietProgress | Out-Null
+        }
+        Write-ScanProgress -Status 'File phase complete' -Current $files.Count -Total $files.Count
+    } finally { Write-ScanProgress -Completed; $script:ProgressTotal=0 }
+    Write-Color ("[SCAN] {0:N0} / {0:N0} candidates processed; see coverage counters for incomplete files." -f $files.Count) Magenta
 }
-
 function Get-ProcessOwner {
     param($CimProcess)
     try {
@@ -857,8 +1107,16 @@ function Get-ProcessArchitecture {
         if (-not [Environment]::Is64BitOperatingSystem) { return 'x86' }
         $process = Get-Process -Id $ProcessId -ErrorAction Stop
         try {
-            if ($process.MainModule.FileName -match '(?i)\\SysWOW64\\') { return 'x86' }
-            return 'x64 or ARM64'
+            $image=[IO.File]::OpenRead($process.MainModule.FileName)
+            $reader=[IO.BinaryReader]::new($image)
+            try {
+                if ($reader.ReadUInt16() -ne 0x5A4D) { return 'Unknown' }
+                $image.Position=0x3C; $offset=$reader.ReadUInt32()
+                if ($offset+6 -gt $image.Length) { return 'Unknown' }
+                $image.Position=$offset
+                if ($reader.ReadUInt32() -ne 0x4550) { return 'Unknown' }
+                switch ($reader.ReadUInt16()) { 0x8664 { return 'x64' }; 0x14C { return 'x86' }; 0xAA64 { return 'ARM64' }; default { return 'Unknown' } }
+            } finally { $reader.Dispose(); $image.Dispose() }
         } finally { $process.Dispose() }
     } catch { return 'Unknown' }
 }
@@ -876,28 +1134,45 @@ function Get-LauncherFromCommandLine {
     return 'Custom / Unknown'
 }
 
+function Split-JvmCommandLine {
+    param([string]$CommandLine)
+    $tokens=[Collections.Generic.List[string]]::new()
+    $current=[Text.StringBuilder]::new()
+    $quoted=$false
+    for ($i=0; $i -lt $CommandLine.Length; $i++) {
+        $char=$CommandLine[$i]
+        if ($char -eq '\') {
+            $slashes=0
+            while ($i -lt $CommandLine.Length -and $CommandLine[$i] -eq '\') { $slashes++; $i++ }
+            if ($i -lt $CommandLine.Length -and $CommandLine[$i] -eq '"') {
+                [void]$current.Append(('\' * [int][Math]::Floor($slashes/2)))
+                if (($slashes % 2) -eq 1) { [void]$current.Append('"') } else { $quoted=-not $quoted }
+            } else { [void]$current.Append(('\' * $slashes)); $i-- }
+        } elseif ($char -eq '"') { $quoted=-not $quoted }
+        elseif ([char]::IsWhiteSpace($char) -and -not $quoted) {
+            if ($current.Length -gt 0) { $tokens.Add($current.ToString()); [void]$current.Clear() }
+        } else { [void]$current.Append($char) }
+    }
+    if ($current.Length -gt 0) { $tokens.Add($current.ToString()) }
+    return @($tokens)
+}
+
 function Get-JvmArguments {
     param([string]$CommandLine)
-    $result = [ordered]@{ JavaAgent=@(); AgentPath=@(); AgentLib=@(); ClassPath=@() }
-    if (-not $CommandLine) { return [pscustomobject]$result }
-    $patterns = [ordered]@{
-        JavaAgent='(?i)(?:^|\s)-javaagent:(?:"([^"]+)"|([^\s]+))'
-        AgentPath='(?i)(?:^|\s)-agentpath:(?:"([^"]+)"|([^\s]+))'
-        AgentLib='(?i)(?:^|\s)-agentlib:([^\s]+)'
-        ClassPath='(?i)(?:^|\s)(?:-classpath|-cp)\s+(?:"([^"]+)"|([^\s]+))'
-    }
-    foreach ($key in $patterns.Keys) {
-        $values = [System.Collections.ArrayList]::new()
-        foreach ($match in [regex]::Matches($CommandLine, $patterns[$key])) {
-            $value = ''
-            for ($i=1; $i -lt $match.Groups.Count; $i++) { if ($match.Groups[$i].Success) { $value = $match.Groups[$i].Value; break } }
-            if ($value) { [void]$values.Add($value) }
-        }
-        $result[$key] = @($values)
+    $result=[ordered]@{ JavaAgent=@(); AgentPath=@(); AgentLib=@(); ClassPath=@(); Jar=@(); ArgFiles=@(); GameDirectories=@() }
+    $tokens=@(Split-JvmCommandLine $CommandLine)
+    for ($i=0; $i -lt $tokens.Count; $i++) {
+        $token=$tokens[$i]
+        if ($token.StartsWith('-javaagent:',[StringComparison]::OrdinalIgnoreCase)) { $result.JavaAgent += $token.Substring(11) }
+        elseif ($token.StartsWith('-agentpath:',[StringComparison]::OrdinalIgnoreCase)) { $result.AgentPath += $token.Substring(11) }
+        elseif ($token.StartsWith('-agentlib:',[StringComparison]::OrdinalIgnoreCase)) { $result.AgentLib += $token.Substring(10) }
+        elseif ($token -in @('-classpath','-cp','--class-path') -and $i+1 -lt $tokens.Count) { $i++; $result.ClassPath += $tokens[$i] }
+        elseif ($token -eq '-jar' -and $i+1 -lt $tokens.Count) { $i++; $result.Jar += $tokens[$i] }
+        elseif ($token -eq '--gameDir' -and $i+1 -lt $tokens.Count) { $i++; $result.GameDirectories += $tokens[$i] }
+        elseif ($token.StartsWith('@')) { $result.ArgFiles += $token.Substring(1) }
     }
     return [pscustomobject]$result
 }
-
 function Get-AuthenticodeInfo {
     param([string]$LiteralPath)
     try {
@@ -956,12 +1231,18 @@ function Invoke-RuntimeScan {
                             Signer = $auth.Signer; SignatureStatus = $auth.Status; SHA256 = $hash
                             Size = $moduleSize; PID = $record.PID
                         })
+                        if ($record.MinecraftAssociation) {
+                            [void]$State.Evidence.Add([pscustomobject]@{ Source='JVM Loaded Module'; Path=$modulePath; SHA256=$hash; PID=$record.PID; TimeCreatedUtc=$record.StartTime })
+                            $moduleFinding=Invoke-FileInspection -LiteralPath $modulePath -State $State -Source 'JVM_MODULE' -QuietProgress
+                            if ($null -ne $moduleFinding) { $moduleFinding.ExecutionEvidence += "PID $($record.PID): loaded module observed"; $moduleFinding.Launcher=$record.Launcher }
+                        }
                     }
                 } finally { $native.Dispose() }
-            } catch { Add-ScanWarning $State 'MODULE' $_.Exception.Message "PID $($record.PID)" }
+            } catch { Add-SourceStatus $State 'JVM Loaded Modules' $false "PID $($record.PID): $($_.Exception.Message)"; Add-ScanWarning $State 'MODULE' $_.Exception.Message "PID $($record.PID)" }
             [void]$State.Processes.Add($record)
 
-            foreach ($agent in @($jvm.JavaAgent)) {
+            foreach ($agentArgument in @($jvm.JavaAgent)) {
+                $agent=($agentArgument -split '=',2)[0]
                 if (Test-Path -LiteralPath $agent -PathType Leaf) { Invoke-FileInspection -LiteralPath $agent -State $State -Source 'JVM' -AlwaysRecord | Out-Null }
                 else {
                     [void]$State.Findings.Add((New-Finding -Family 'Unknown' -CurrentName ([IO.Path]::GetFileName($agent)) -FullPath $agent -Extension ([IO.Path]::GetExtension($agent)) -ActualFileType 'Unavailable' -Category 'JAVA_AGENT' -Status 'RUNTIME_ONLY' -LoaderType 'Java Agent' -Launcher $record.Launcher -ExecutionEvidence @("PID $($record.PID) -javaagent") -EvidenceSources @('JVM arguments') -Confidence 0 -VerificationStatus 'UNVERIFIED' -Verdict 'RUNTIME TRACE' -DetectionReasons @('Java Agent usage is not automatically a cheat; file content was unavailable.') -Source 'JVM'))
@@ -970,7 +1251,20 @@ function Invoke-RuntimeScan {
             foreach ($agentPath in @($jvm.AgentPath)) {
                 $candidate = ($agentPath -split '=')[0]
                 if (Test-Path -LiteralPath $candidate -PathType Leaf) { Invoke-FileInspection -LiteralPath $candidate -State $State -Source 'JVM' -AlwaysRecord | Out-Null }
+                else { [void]$State.Findings.Add((New-Finding -CurrentName ([IO.Path]::GetFileName($candidate)) -FullPath $candidate -Extension ([IO.Path]::GetExtension($candidate)) -Category 'JVMTI' -Status 'RUNTIME_ONLY' -Verdict 'RUNTIME TRACE' -EvidenceSources @('JVM arguments') -ExecutionEvidence @("PID $($record.PID): -agentpath") -DetectionReasons @('Native agent argument observed; unavailable content and agent usage do not establish cheating.'))) }
             }
+            foreach ($library in @($jvm.AgentLib)) {
+                [void]$State.Evidence.Add([pscustomobject]@{ Source='JVM agentlib'; PID=$record.PID; Library=$library; Note='Library name only; agent usage is not cheat evidence.' })
+            }
+            $runtimePaths=@($jvm.Jar)
+            foreach ($classPath in @($jvm.ClassPath)) { $runtimePaths += @($classPath -split ';') }
+            foreach ($runtimePath in @($runtimePaths | Sort-Object -Unique)) {
+                if ([IO.Path]::IsPathRooted($runtimePath) -and (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+                    $runtimeFinding=Invoke-FileInspection -LiteralPath $runtimePath -State $State -Source 'JVM_CLASSPATH' -QuietProgress
+                    if ($null -ne $runtimeFinding) { $runtimeFinding.ExecutionEvidence += "PID $($record.PID): command-line reference (not proof of class loading)" }
+                } elseif ($runtimePath) { [void]$State.Evidence.Add([pscustomobject]@{ Source='JVM unresolved classpath'; Path=$runtimePath; PID=$record.PID; Note='Relative paths and wildcards are not resolved against the scanner working directory.' }) }
+            }
+            foreach ($argumentFile in @($jvm.ArgFiles)) { Add-SourceStatus $State 'JVM argument file' $false "Argument-file contents not resolved: $argumentFile" }
         }
         Add-SourceStatus $State 'Running Processes / JVM Arguments / Loaded Modules' $true ("{0} Java processes" -f @($processes).Count)
     } catch {
@@ -1084,43 +1378,45 @@ function Inspect-AdsPayload {
     param([string]$HostPath, $StreamInfo, $State)
     $streamName = [string]$StreamInfo.Stream
     $streamPath = "$HostPath`:$streamName"
-    $host = Get-Item -LiteralPath $HostPath -Force
+    $hostFile = Get-Item -LiteralPath $HostPath -Force
     $stream = [IO.File]::Open($streamPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
     try {
         $magic = Get-MagicInfoFromStream -Stream $stream -DisplayedExtension ([IO.Path]::GetExtension($HostPath))
         $sha256 = Get-StreamSha256 $stream
-        $matches = [System.Collections.ArrayList]::new()
-        foreach ($sig in (Get-SignaturesByType @('SHA256'))) { if ([string]$sig.Value -eq $sha256) { Add-SignatureMatch $matches $sig "$HostPath`:$streamName" $sha256 } }
+        $signatureMatches = [System.Collections.ArrayList]::new()
+        foreach ($sig in (Get-SignaturesByType @('SHA256'))) { if ([string]$sig.Value -eq $sha256) { Add-SignatureMatch $signatureMatches $sig "$HostPath`:$streamName" $sha256 } }
         $jar = $null
         if ($magic.ActualType -eq 'Java Archive / ZIP') {
             $stream.Position = 0
             $jar = Inspect-ZipStream -Stream $stream -DisplayPath "$HostPath`:$streamName" -State $State
-            foreach ($match in $jar.Matches) { [void]$matches.Add($match) }
+            foreach ($match in $jar.Matches) { [void]$signatureMatches.Add($match) }
         } else {
             foreach ($sig in (Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))) {
                 $needle = if ([string]$sig.Type -eq 'ByteSequence') { Convert-HexToBytes ([string]$sig.Value) } else { [Text.Encoding]::UTF8.GetBytes([string]$sig.Value) }
-                if (Test-StreamContainsBytes $stream $needle) { Add-SignatureMatch $matches $sig "$HostPath`:$streamName" '[byte content match]' }
+                if (Test-StreamContainsBytes $stream $needle) { Add-SignatureMatch $signatureMatches $sig "$HostPath`:$streamName" '[byte content match]' }
             }
         }
-        $score = Get-ScoreForMatches @($matches) $false $false $true
+        $score = Get-ScoreForMatches @($signatureMatches) $false $false $true
         $knownClean = Test-KnownCleanHash $sha256
-        $decision = Get-Decision @($matches) $score $knownClean
+        $decision = Get-Decision @($signatureMatches) $score $knownClean
         $reasons = [System.Collections.ArrayList]::new()
-        foreach ($match in @($matches | Sort-Object ID -Unique)) { [void]$reasons.Add("$($match.Type) signature $($match.ID) matched in ADS $streamName") }
+        foreach ($match in @($signatureMatches | Sort-Object ID -Unique)) { [void]$reasons.Add("$($match.Type) signature $($match.ID) matched in ADS $streamName") }
         if ($magic.ActualType -eq 'Windows PE') { [void]$reasons.Add('Named ADS contains an embedded PE payload; this is not automatically DoomsDay.') }
         elseif ($magic.ActualType -eq 'Java Archive / ZIP') { [void]$reasons.Add('Named ADS contains an embedded archive payload; this is not automatically DoomsDay.') }
         elseif ($magic.ActualType -eq 'Java Class') { [void]$reasons.Add('Named ADS contains an embedded Java class; this is not automatically DoomsDay.') }
         if ($reasons.Count -eq 0) { [void]$reasons.Add('Named ADS is present but no DoomsDay-specific signature matched.') }
-        $finding = New-Finding -Family $(if ($matches.Count -gt 0) {'DoomsDay'} else {'Unknown'}) -CurrentName "$($host.Name):$streamName" `
-            -FullPath "$($host.FullName):$streamName" -Extension $host.Extension -ActualFileType $magic.ActualType -Category 'ADS_PAYLOAD' -Status 'ADS' `
-            -Size ([long]$StreamInfo.Length) -SHA256 $sha256 -CreatedUtc $host.CreationTimeUtc -ModifiedUtc $host.LastWriteTimeUtc -LastAccessUtc $host.LastAccessTimeUtc `
-            -EvidenceSources @('ADS') -Evidence @($matches) -Confidence $score -VerificationStatus $decision.Verification -Verdict $decision.Verdict `
+        $finding = New-Finding -Family $(if ($signatureMatches.Count -gt 0) {'DoomsDay'} else {'Unknown'}) -CurrentName "$($hostFile.Name):$streamName" `
+            -FullPath "$($hostFile.FullName):$streamName" -Extension $hostFile.Extension -ActualFileType $magic.ActualType -Category 'ADS_PAYLOAD' -Status 'ADS' `
+            -Size ([long]$StreamInfo.Length) -SHA256 $sha256 -CreatedUtc $hostFile.CreationTimeUtc -ModifiedUtc $hostFile.LastWriteTimeUtc -LastAccessUtc $hostFile.LastAccessTimeUtc `
+            -EvidenceSources @('ADS') -Evidence @($signatureMatches) -Confidence $score -VerificationStatus $decision.Verification -Verdict $decision.Verdict `
             -DetectionReasons @($reasons) -Source 'ADS' -MagicBytes $magic.MagicBytes
         if ($decision.EligibleForDetected) {
-            $stream.Position = 0; $secondHash = Get-StreamSha256 $stream
-            if ($secondHash -eq $sha256 -and -not $knownClean) { $finding.VerificationStatus='VERIFIED'; $finding.Verdict='DETECTED'; [void]$finding.DetectionReasons.Add('ADS content hash reproduced during verification.') }
-            else { $finding.VerificationStatus='CONFLICTING'; $finding.Verdict='INCONCLUSIVE' }
+            $confirm=Confirm-FileFinding -LiteralPath $streamPath -InitialFinding $finding -InitialMatchIds @($signatureMatches | Select-Object -ExpandProperty ID) -State $State
+            $finding.VerificationStatus=$confirm.Status
+            $finding.Verdict=if ($confirm.Verified) { 'DETECTED' } else { 'INCONCLUSIVE' }
+            $finding.DetectionReasons += $confirm.Reason
         }
+        if ($null -ne $jar -and -not $jar.AllEntriesScanned) { $State.FilesSkipped++; $finding.Verdict='INCONCLUSIVE'; $finding.VerificationStatus='UNVERIFIED' }
         [void]$State.Findings.Add($finding); $State.AdsFindings++
         return $finding
     } finally { $stream.Dispose() }
@@ -1130,23 +1426,25 @@ function Invoke-AdsScan {
     param([string[]]$Roots, $State, [switch]$DeepScan)
     Write-Stage 'ADS' 'Enumerating NTFS alternate data streams (read-only)...'
     $files = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($root in @(Get-NormalizedScanRoots -Roots $Roots)) {
-        try {
-            foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Force -Recurse:$DeepScan -ErrorAction SilentlyContinue)) { [void]$files.Add($file.FullName) }
-        } catch { Add-ScanWarning $State 'ADS' $_.Exception.Message $root }
-    }
+    foreach ($file in Get-ReadOnlyFiles -Roots $Roots -State $State -Recurse:$DeepScan) { [void]$files.Add($file.FullName) }
+    $adsErrors=0
     $fileList = @($files | Sort-Object)
     if ($fileList.Count -gt 0) { Write-Stage 'ADS' ("Checking ADS on {0:N0} files with one-line progress." -f $fileList.Count) }
     $fileIndex = 0
     foreach ($file in $fileList) {
         $fileIndex++
-        Write-ScanProgress -Activity 'Reveal ScreenShare - ADS analysis' -Status ("{0:N0} / {1:N0} - {2}" -f $fileIndex, $fileList.Count, [IO.Path]::GetFileName($file)) -Current $fileIndex -Total $fileList.Count
+        Write-ScanProgress -Activity 'Reveal ScreenShare - ADS analysis' -Status 'Reading named streams' -Current $fileIndex -Total $fileList.Count
         try {
             $streams = @(Get-Item -LiteralPath $file -Stream * -ErrorAction Stop)
             foreach ($streamInfo in $streams) {
                 $name = [string]$streamInfo.Stream
                 if ($name -in @(':$DATA','::$DATA','$DATA')) { continue }
                 if ($name -ieq 'Zone.Identifier') {
+                    $zoneMagic=Get-MagicInfo "$file`:$name"
+                    if ($zoneMagic.ActualType -in @('Windows PE','Java Archive / ZIP','Java Class')) {
+                        Inspect-AdsPayload -HostPath $file -StreamInfo $streamInfo -State $State | Out-Null
+                        continue
+                    }
                     $zone = Get-ZoneIdentifier -HostPath $file -StreamName $name
                     [void]$State.Evidence.Add([pscustomobject][ordered]@{
                         Source='Zone.Identifier'; HostPath=$file; Stream=$name; Length=[long]$streamInfo.Length
@@ -1155,16 +1453,18 @@ function Invoke-AdsScan {
                     continue
                 }
                 try { Inspect-AdsPayload -HostPath $file -StreamInfo $streamInfo -State $State | Out-Null }
-                catch { Add-ScanWarning $State 'ADS' $_.Exception.Message "$file`:$name" }
+                catch { $adsErrors++; $State.CorruptedUnreadable++; Add-ScanWarning $State 'ADS' $_.Exception.Message "$file`:$name" }
             }
         } catch [System.Management.Automation.ParameterBindingException] {
             Add-ScanWarning $State 'ADS' 'The current filesystem/provider does not expose the Stream parameter.' $file
+            $adsErrors++; $State.FilesSkipped += $fileList.Count-$fileIndex+1
             break
-        } catch { }
+        } catch { $adsErrors++; $State.FilesSkipped++; Add-ScanWarning $State 'ADS' $_.Exception.Message $file }
     }
     Write-ScanProgress -Activity 'Reveal ScreenShare - ADS analysis' -Completed
     if ($fileList.Count -gt 0) { Write-Color ("[ADS] {0:N0} files checked; {1:N0} named payload streams found." -f $fileList.Count, $State.AdsFindings) Magenta }
-    Add-SourceStatus $State 'NTFS Alternate Data Streams' $true ("{0} named payload streams" -f $State.AdsFindings)
+    Add-SourceStatus $State 'NTFS Alternate Data Streams (files)' ($adsErrors -eq 0) ("{0} named streams; {1} failures" -f $State.AdsFindings,$adsErrors)
+    if ($PSVersionTable.PSVersion -lt [Version]'7.2') { Add-SourceStatus $State 'Directory ADS' $false 'Windows PowerShell 5.1 Stream provider does not enumerate directory streams.' }
 }
 
 function Get-UsnJournalEvidence {
@@ -1198,7 +1498,8 @@ function Get-UsnJournalEvidence {
         $errorText = $process.StandardError.ReadToEnd(); $process.WaitForExit()
         if ($process.ExitCode -ne 0) { throw "fsutil exited with code $($process.ExitCode): $errorText" }
         $process.Dispose()
-        Add-SourceStatus $State 'USN Journal' $true "$count candidate lifecycle records"
+        Add-SourceStatus $State 'USN Journal (raw CSV candidates)' $true "$count candidate records"
+        Add-SourceStatus $State 'USN identity/path reconstruction' $false 'Raw fsutil candidate lines only; no FRN-based rename chain or complete path reconstruction is asserted.'
     } catch { Add-SourceStatus $State 'USN Journal' $false $_.Exception.Message; Add-ScanWarning $State 'USN' $_.Exception.Message }
 }
 
@@ -1236,7 +1537,7 @@ function Get-RegistryArtifactEvidence {
                 $amcacheRoot = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted'
                 if (Test-Path -LiteralPath $amcacheRoot) {
                     $item = Get-Item -LiteralPath $amcacheRoot
-                    foreach ($name in $item.GetValueNames()) { if ($name -match '(?i)\.(jar|exe|dll|class|zip)$') { [void]$State.Evidence.Add([pscustomobject]@{ Source='Amcache/Persisted'; Path=$name }) } }
+                    foreach ($name in $item.GetValueNames()) { if ($name -match '(?i)\.(jar|exe|dll|class|zip)$') { [void]$State.Evidence.Add([pscustomobject]@{ Source='PcaSvc/Persisted'; Path=$name }) } }
                 }
             } else {
                 foreach ($key in @(Get-ChildItem -LiteralPath $entry.Path -Recurse -ErrorAction SilentlyContinue)) {
@@ -1336,7 +1637,7 @@ function Get-BrowserDownloadEvidence {
                         $zone = Get-ZoneIdentifier $file.FullName 'Zone.Identifier'
                         [void]$State.Evidence.Add([pscustomobject][ordered]@{
                             Source='Browser Downloads / Zone.Identifier'; Filename=$file.Name; URL=$zone.HostUrl
-                            Referrer=$zone.ReferrerUrl; TargetPath=$file.FullName; DownloadTime=$file.CreationTimeUtc
+                            Referrer=$zone.ReferrerUrl; TargetPath=$file.FullName; DownloadTime=$null; FileCreatedUtc=$file.CreationTimeUtc
                             Browser='Unknown'; CurrentFileExists=$true; ZoneId=$zone.ZoneId
                         })
                         $count++
@@ -1364,7 +1665,7 @@ function Get-PowerShellForensics {
             $lineNumber = 0
             foreach ($line in [IO.File]::ReadLines($historyPath)) {
                 $lineNumber++
-                if ($line -match '(?i)javaw?|\.jar|\.dll|\.exe|loader|minecraft|agentpath|javaagent') {
+                if ($line -match '(?i)javaw?|\.jar|\.dll|\.exe|loader|minecraft|agentpath|javaagent|oracle_jre_usage|WriteProcessMemory|VirtualQueryEx|pymem') {
                     [void]$State.Evidence.Add([pscustomobject]@{ Source='PSReadLine History'; Path=$historyPath; Line=$lineNumber; Command=$line }); $count++
                 }
             }
@@ -1374,7 +1675,7 @@ function Get-PowerShellForensics {
         $start = (Get-Date).AddDays(-30)
         $events = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-PowerShell/Operational'; Id=@(4103,4104); StartTime=$start } -ErrorAction Stop
         foreach ($event in $events) {
-            if ($event.Message -match '(?i)javaw?|\.jar|\.dll|\.exe|loader|minecraft|agentpath|javaagent') {
+            if ($event.Message -match '(?i)javaw?|\.jar|\.dll|\.exe|loader|minecraft|agentpath|javaagent|oracle_jre_usage|WriteProcessMemory|VirtualQueryEx|pymem') {
                 [void]$State.Evidence.Add([pscustomobject]@{ Source='PowerShell Operational'; EventId=$event.Id; TimeCreatedUtc=$event.TimeCreated.ToUniversalTime(); RecordId=$event.RecordId; Message=$event.Message }); $count++
             }
         }
@@ -1395,7 +1696,7 @@ function Get-WindowsEventEvidence {
         foreach ($event in $events) {
             if ($event.Id -in @(1102,4719)) {
                 [void]$State.Integrity.Add([pscustomobject]@{ Severity='WARNING'; Code="EVENT_$($event.Id)"; TimeCreatedUtc=$event.TimeCreated.ToUniversalTime(); Message='Security audit configuration/log integrity event observed; not DoomsDay evidence by itself.' })
-            } elseif ($event.Message -match '(?i)javaw?|\.jar|\.dll|loader|minecraft|agentpath|javaagent') {
+            } elseif ($event.Message -match '(?i)javaw?|\.jar|\.dll|loader|minecraft|agentpath|javaagent|oracle_jre_usage|WriteProcessMemory|VirtualQueryEx|pymem') {
                 [void]$State.Evidence.Add([pscustomobject]@{ Source='Security 4688'; EventId=4688; TimeCreatedUtc=$event.TimeCreated.ToUniversalTime(); RecordId=$event.RecordId; Message=$event.Message })
             }
         }
@@ -1416,16 +1717,90 @@ function Get-AdditionalArtifactMetadata {
             try {
                 $item = Get-Item -LiteralPath $entry.Path -Force
                 [void]$State.Evidence.Add([pscustomobject]@{ Source=$entry.Source; Path=$item.FullName; Size=$item.Length; ModifiedUtc=$item.LastWriteTimeUtc; Note='Source availability and metadata collected without modifying or copying the live database/hive.' })
-                Add-SourceStatus $State $entry.Source $true 'Metadata available'
+                Add-SourceStatus $State ($entry.Source+' metadata') $true 'Metadata available'
+                Add-SourceStatus $State ($entry.Source+' record parsing') $false 'Database/hive records are not decoded by this collector.'
             } catch { Add-SourceStatus $State $entry.Source $false $_.Exception.Message }
         } else { Add-SourceStatus $State $entry.Source $false 'Source not present' }
+    }
+}
+
+function Get-EventXmlFields {
+    param([string]$XmlText)
+    $settings=[Xml.XmlReaderSettings]::new(); $settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit; $settings.XmlResolver=$null
+    $source=[IO.StringReader]::new($XmlText); $reader=[Xml.XmlReader]::Create($source,$settings)
+    try {
+        $document=[Xml.XmlDocument]::new(); $document.XmlResolver=$null; $document.Load($reader)
+        $fields=@{}
+        foreach ($node in $document.SelectNodes("//*[local-name()='EventData']/*[local-name()='Data']")) { $fields[$node.GetAttribute('Name')]=[string]$node.InnerText }
+        return $fields
+    } finally { $reader.Dispose(); $source.Dispose() }
+}
+
+function Get-SysmonEvidence {
+    param($State)
+    Write-Stage 'SYSMON' 'Reading existing Java-related events; no service installation or configuration changes.'
+    $log='Microsoft-Windows-Sysmon/Operational'
+    try {
+        $logInfo=Get-WinEvent -ListLog $log -ErrorAction Stop
+        if (-not $logInfo.IsEnabled) { Add-SourceStatus $State 'Sysmon' $false 'Log disabled; no inference of cheating.'; return }
+        $filter=@{ LogName=$log; Id=@(1,7,8,10,11,15,23,25,26); StartTime=(Get-Date).AddDays(-30) }
+        $count=0
+        try {
+            Get-WinEvent -FilterHashtable $filter -ErrorAction Stop | ForEach-Object {
+                $event=$_; $data=Get-EventXmlFields $event.ToXml()
+                $values=@($data.Values) -join ' '
+                if ($values -match '(?i)javaw?\.exe|minecraft|\.jar(?:\s|$)|oracle_jre_usage|doomsday') {
+                    $path=''
+                    switch ($event.Id) { 7 { $path=[string]$data.ImageLoaded }; {$_ -in @(11,15,23,26)} { $path=[string]$data.TargetFilename }; default { $path=[string]$data.Image } }
+                    $hash=''
+                    if ($event.Id -in @(1,7,23,26) -and [string]$data.Hashes -match '(?:^|[,;])SHA256=([A-Fa-f0-9]{64})(?:$|[,;])') { $hash=$Matches[1].ToUpperInvariant() }
+                    $record=[pscustomobject]@{ Source='Sysmon'; EventId=$event.Id; RecordId=$event.RecordId; TimeCreatedUtc=$event.TimeCreated.ToUniversalTime(); Path=$path; SHA256=$hash; ProcessGuid=[string]$data.ProcessGuid; Data=$data }
+                    [void]$State.Evidence.Add($record); $count++
+                    if ($event.Id -in @(8,10) -and [string]$data.TargetImage -match '(?i)\\javaw?\.exe$') {
+                        $sourcePath=[string]$data.SourceImage
+                        [void]$State.Findings.Add((New-Finding -CurrentName ([IO.Path]::GetFileName($sourcePath)) -FullPath $sourcePath -Extension ([IO.Path]::GetExtension($sourcePath)) -Category 'UNKNOWN' -Status 'UNKNOWN' -Verdict 'RUNTIME TRACE' -EvidenceSources @('Sysmon') -Evidence @($record) -ExecutionEvidence @("Sysmon event $($event.Id), record $($event.RecordId), target $($data.TargetImage)") -DetectionReasons @('Process access or remote-thread event involving Java. Debuggers, overlays and security tools also produce these events; not DoomsDay evidence.')))
+                    }
+                    if ($event.Id -eq 25) { [void]$State.Integrity.Add([pscustomobject]@{ Severity='WARNING'; Code='SYSMON_PROCESS_TAMPERING'; Path=$path; RecordId=$event.RecordId; Message='Sysmon process-image tampering event; family attribution unavailable.' }) }
+                    if ($event.Id -in @(23,26) -and $path) {
+                        $hashMatches=@(Get-SignaturesByType @('SHA256') | Where-Object { $_.Value -eq $hash -and $_.PSObject.Properties['Verified'] -and $_.Verified -is [bool] -and $_.Verified })
+                        if ($hashMatches.Count -gt 0 -and -not (Test-KnownCleanHash $hash)) {
+                            $historicalVerified=$false
+                            try {
+                                $again=Get-WinEvent -LogName $log -FilterXPath ("*[System[EventRecordID={0}]]" -f $event.RecordId) -ErrorAction Stop
+                                $againData=Get-EventXmlFields $again.ToXml()
+                                $historicalVerified=([string]$againData.Hashes -eq [string]$data.Hashes -and [string]$againData.TargetFilename -eq $path)
+                            } catch { }
+                            [void]$State.Findings.Add((New-Finding -Family 'DoomsDay' -CurrentName ([IO.Path]::GetFileName($path)) -FullPath $path -Extension ([IO.Path]::GetExtension($path)) -Status 'DELETED' -Category 'DELETED_PAYLOAD' -SHA256 $hash -Verdict 'DELETED TRACE' -VerificationStatus $(if ($historicalVerified) {'VERIFIED'} else {'UNVERIFIED'}) -EvidenceSources @('Sysmon deletion hash') -Evidence @($record) -DetectionReasons @('Historical SHA-256 matches an attested family signature. Verification concerns the reread event, not recovered payload bytes; current same-path files are not assumed identical.')))
+                        }
+                    }
+                }
+            }
+        } catch { if ($_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') { throw } }
+        Add-SourceStatus $State 'Sysmon' $true "$count relevant events within 30 days; event availability depends on pre-existing configuration."
+    } catch { Add-SourceStatus $State 'Sysmon' $false $_.Exception.Message; Add-ScanWarning $State 'SYSMON' 'Existing log could not be read; this is not evidence of bypass.' }
+}
+
+function Get-OracleUsageEvidence {
+    param($State)
+    if (-not $env:ProgramData) { return }
+    $root=Join-Path $env:ProgramData 'Oracle\Java\.oracle_jre_usage'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        [void]$State.Evidence.Add([pscustomobject]@{ Source='Oracle JRE usage'; Path=$root; Exists=$false; Note='Absence is normal on many Java installations and is not evidence of deletion or bypass.' })
+        return
+    }
+    foreach ($file in Get-ReadOnlyFiles -Roots @($root) -State $State -Recurse) {
+        try {
+            $lines=@()
+            if ($file.Length -le 1048576) { $lines=@([IO.File]::ReadLines($file.FullName) | Where-Object { $_ -match '(?i)java|\.jar|minecraft' }) }
+            [void]$State.Evidence.Add([pscustomobject]@{ Source='Oracle JRE usage'; Path=$file.FullName; ModifiedUtc=$file.LastWriteTimeUtc; RelevantLines=$lines; Note='Java usage context only, not a DoomsDay signature.' })
+        } catch { Add-ScanWarning $State 'JRE USAGE' $_.Exception.Message $file.FullName }
     }
 }
 
 function Invoke-QuickScan {
     param($State)
     Write-Section 'QUICK SCAN'
-    $roots = Get-MinecraftLocations
+    $roots = @(Get-MinecraftLocations)
     if ($roots.Count -eq 0) { Add-ScanWarning $State 'DISCOVERY' 'No known Minecraft installation directory was found.' }
     else { Invoke-CandidateScan -Roots $roots -State $State }
     Invoke-RuntimeScan -State $State
@@ -1450,7 +1825,7 @@ function Get-DefaultAdsRoots {
 function Invoke-FullScan {
     param($State)
     Write-Section 'FULL FORENSIC SCAN'
-    $roots = Get-MinecraftLocations
+    $roots = @(Get-DefaultAdsRoots -IncludeAppData)
     if ($roots.Count -eq 0) { Add-ScanWarning $State 'DISCOVERY' 'No known Minecraft installation directory was found.' }
     else { Invoke-CandidateScan -Roots $roots -State $State -Full }
     Invoke-RuntimeScan -State $State
@@ -1462,28 +1837,51 @@ function Invoke-FullScan {
     Get-BrowserDownloadEvidence -State $State
     Get-PowerShellForensics -State $State
     Get-WindowsEventEvidence -State $State
+    Get-SysmonEvidence -State $State
+    Get-OracleUsageEvidence -State $State
     Get-AdditionalArtifactMetadata -State $State
-    Invoke-AdsScan -Roots (Get-DefaultAdsRoots) -State $State -DeepScan
+    Invoke-AdsScan -Roots (Get-DefaultAdsRoots -IncludeAppData) -State $State -DeepScan
     Write-Stage 'CORRELATE' 'Building evidence chains...'
     Invoke-EvidenceCorrelation -State $State
 }
 
 function Invoke-EvidenceCorrelation {
     param($State)
-    foreach ($finding in @($State.Findings)) {
-        $name = [regex]::Escape([string]$finding.CurrentName)
-        if (-not $name) { continue }
-        $related = @($State.Evidence | Where-Object { ($_ | ConvertTo-Json -Compress -Depth 5) -match $name })
-        foreach ($evidence in $related) {
-            $source = [string]$evidence.Source
+    $byPath=@{}; $byHash=@{}
+    foreach ($evidence in $State.Evidence) {
+        foreach ($property in @('Path','FullPath','HostPath','TargetPath')) {
+            if ($evidence.PSObject.Properties[$property] -and $evidence.$property) {
+                $pathKey=([string]$evidence.$property).ToLowerInvariant()
+                if (-not $byPath.ContainsKey($pathKey)) { $byPath[$pathKey]=[Collections.ArrayList]::new() }
+                [void]$byPath[$pathKey].Add($evidence)
+            }
+        }
+        if ($evidence.PSObject.Properties['SHA256'] -and [string]$evidence.SHA256 -match '^[A-Fa-f0-9]{64}$') {
+            $hashKey=([string]$evidence.SHA256).ToUpperInvariant()
+            if (-not $byHash.ContainsKey($hashKey)) { $byHash[$hashKey]=[Collections.ArrayList]::new() }
+            [void]$byHash[$hashKey].Add($evidence)
+        }
+    }
+    foreach ($finding in $State.Findings) {
+        $links=[Collections.ArrayList]::new()
+        $pathKey=([string]$finding.Path).ToLowerInvariant()
+        if ($byPath.ContainsKey($pathKey)) {
+            foreach ($evidence in $byPath[$pathKey]) { [void]$links.Add([pscustomobject]@{ Kind='EXACT_PATH_CONTEXT_ONLY'; Record=$evidence }) }
+        }
+        if ($finding.SHA256 -and $byHash.ContainsKey($finding.SHA256.ToUpperInvariant())) {
+            foreach ($evidence in $byHash[$finding.SHA256.ToUpperInvariant()]) { [void]$links.Add([pscustomobject]@{ Kind='EXACT_SHA256'; Record=$evidence }) }
+        }
+        foreach ($link in $links) {
+            $source=[string]$link.Record.Source
             if ($source -and $source -notin $finding.EvidenceSources) { $finding.EvidenceSources += $source }
         }
-        if ($related.Count -gt 0) { $finding.Evidence += $related }
+        if ($links.Count -gt 0) { $finding.Evidence += @($links) }
+        # Same path can be reused by a different file. Context never upgrades a verdict.
     }
 }
-
 function Update-DoomsDaySignatures {
     Write-Stage 'UPDATE' 'Downloading JSON signature data only; no remote code will be executed.'
+    $previousDatabase=$script:Signatures
     try {
         $response = Invoke-WebRequest -Uri $script:SignatureUrl -UseBasicParsing -TimeoutSec 20 -Headers @{ Accept='application/json' }
         if ($response.StatusCode -ne 200) { throw "HTTP $($response.StatusCode)" }
@@ -1493,6 +1891,8 @@ function Update-DoomsDaySignatures {
         $candidate = $response.Content | ConvertFrom-Json
         if ($candidate.schemaVersion -ne 1 -or $candidate.family -ne 'DoomsDay') { throw 'Downloaded signature schema/family is invalid.' }
         $temporary = "$script:SignaturePath.download"
+        $databaseDirectory=Split-Path -Parent $script:SignaturePath
+        if (-not (Test-Path -LiteralPath $databaseDirectory -PathType Container)) { [void][IO.Directory]::CreateDirectory($databaseDirectory) }
         [IO.File]::WriteAllText($temporary, [string]$response.Content, [Text.UTF8Encoding]::new($false))
         $old = $script:SignaturePath; $script:SignaturePath = $temporary
         try { Import-DoomsDaySignatures | Out-Null }
@@ -1502,6 +1902,7 @@ function Update-DoomsDaySignatures {
         Write-Color '[OK] Signature database updated and validated.' Green
         return $true
     } catch {
+        $script:Signatures=$previousDatabase
         Write-Color "[WARNING] Signature update failed: $($_.Exception.Message)" Yellow
         return $false
     }
@@ -1584,13 +1985,15 @@ function Show-ScanComplete {
     }
     foreach ($key in $rows.Keys) { Write-Color (('{0,-26}: {1}' -f $key, $rows[$key])) Magenta }
     Write-Host ''
-    if ($State.FilesSkipped -gt 0 -or $State.CorruptedUnreadable -gt 0 -or $State.UnavailableSources.Count -gt 0) {
+    if ($State.VerifiedSignatureCount -eq 0) {
+        Write-Color '[INCONCLUSIVE] No verified family signatures are installed. Community-pattern findings are unverified and must not be used as a ban decision.' Yellow
+    } elseif ($State.FilesSkipped -gt 0 -or $State.CorruptedUnreadable -gt 0 -or $State.UnavailableSources.Count -gt 0) {
         Write-Color '[INCONCLUSIVE]' Yellow
         Write-Color 'Some candidate artifacts or evidence sources could not be fully analyzed.' Yellow
     } elseif ($State.Statistics.DoomsDayDetections -gt 0) {
         Write-Color '[DETECTED]' Red
         Write-Color 'Verified DoomsDay-specific evidence was found. Review every evidence field before action.' Red
-    } elseif ($State.Statistics.HighConfidenceFindings -gt 0 -or $State.Statistics.SuspiciousFindings -gt 0) {
+    } elseif (@($State.Findings | Where-Object Verdict -ne 'INFO').Count -gt 0) {
         Write-Color '[MANUAL REVIEW REQUIRED]' Yellow
         Write-Color 'No finding met the strict DETECTED rule, but reviewable indicators were found.' Yellow
     } else {
@@ -1644,9 +2047,9 @@ function Export-ScanReport {
                 Write-Color "[WARNING] Project folder was not writable. Reports will be saved to $script:ReportDirectory" Yellow
             }
         }
-        $stamp = ConvertTo-SafeDateString $State.CompletedUtc 'yyyyMMdd_HHmmss'
+        $stamp = ConvertTo-SafeDateString $State.CompletedUtc 'yyyyMMdd_HHmmss_fff'
         if ($stamp -eq 'UNAVAILABLE') { $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss') }
-        $base = Join-Path $script:ReportDirectory "DoomsDayFinder_Report_$stamp"
+        $base = Join-Path $script:ReportDirectory ("DoomsDayFinder_Report_{0}_{1}" -f $stamp,$State.ScanId.Substring(0,8))
         $jsonPath = "$base.json"; $textPath = "$base.txt"
         $json = $State | ConvertTo-Json -Depth 20
         [IO.File]::WriteAllText($jsonPath, $json, [Text.UTF8Encoding]::new($false))
@@ -1665,7 +2068,7 @@ function Invoke-BuiltInSelfTest {
     try { if (-not (Test-GenericIndicator 'Minecraft')) { [void]$failures.Add('Generic blacklist') } } catch { [void]$failures.Add($_.Exception.Message) }
     try { if ((Get-StringSha256 'abc') -ne 'BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD') { [void]$failures.Add('SHA-256') } } catch { [void]$failures.Add($_.Exception.Message) }
     try {
-        $stream = [IO.MemoryStream]::new([byte[]](0x00,0xCA,0xFE,0xBA,0xBE,0x00))
+        $stream = [IO.MemoryStream]::new([byte[]](0xCA,0xFE,0xBA,0xBE,0x00))
         $magic = Get-MagicInfoFromStream $stream '.class'; $stream.Dispose()
         if ($magic.ActualType -ne 'Java Class') { [void]$failures.Add('Magic bytes') }
     } catch { [void]$failures.Add($_.Exception.Message) }
@@ -1681,6 +2084,7 @@ function Invoke-BuiltInSelfTest {
 function Invoke-ScanMode {
     param([string]$SelectedMode, [string]$SelectedPath = '', [switch]$DeepAds)
     $script:InspectionCache = @{}
+    $script:HashCache = @{}
     $state = New-ScanState $SelectedMode
     if (-not $state.IsAdministrator) { Write-Color '[LIMITED MODE] Administrator-only forensic sources will be skipped.' Yellow }
     switch ($SelectedMode) {

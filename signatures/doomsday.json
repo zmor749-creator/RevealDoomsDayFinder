@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "family": "DoomsDay",
+  "databaseVersion": "2026-09-01-community-research",
+  "generatedUtc": "2026-09-01T00:00:00Z",
+  "notes": "Community byte patterns have not been validated against authentic DoomsDay samples. They can produce review findings but cannot authorize DETECTED. Overlapping patterns share one independence group. No detection-rate claim is supported.",
+  "signatures": [
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-1",
+      "Type": "ByteSequence",
+      "Value": "6161370E160609949E0029033EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A160C14005C6588B800",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
+    },
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-2",
+      "Type": "ByteSequence",
+      "Value": "0C1504851D85160A6161370E160609949E0029033EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A16",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
+    },
+    {
+      "ID": "COMMUNITY-ZEDOON-BYTES-3",
+      "Type": "ByteSequence",
+      "Value": "5910071088544C2A2BB8004D3B033DA7000A2B1C03548402011C1008A1FFF61A9E000C1A110800A2000503AC04AC00000000000A0005004E000101FA000001D3",
+      "Source": "https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1",
+      "Version": "upstream-observed-2026-09-01",
+      "Confidence": 20,
+      "Specificity": "Medium",
+      "LastUpdated": "2026-09-01",
+      "Verified": false,
+      "IndependenceGroup": "community-loader-bytecode-unvalidated",
+      "Enabled": true
+    }
+  ],
+  "knownCleanHashes": []
+}
