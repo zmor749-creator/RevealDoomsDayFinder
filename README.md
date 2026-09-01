@@ -1,6 +1,6 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.3.0.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.4.0.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
@@ -11,12 +11,15 @@ Windows PowerShell 5.1 veya Windows üzerinde PowerShell 7 gerekir. Yönetici ol
 İndirdiğiniz dosyayı masaüstüne kaydettikten sonra **PowerShell** içine yazın:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path ([Environment]::GetFolderPath('Desktop')) 'DoomsDayFinder.ps1') -Mode Full
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path ([Environment]::GetFolderPath('Desktop')) 'DoomsDayFinder.ps1') -Mode Fast
 ```
 
-Bu, önceden indirdiğiniz yerel scripti çalıştırır; internetten kod indirip çalıştırmaz. ExecutionPolicy seçeneği yalnızca açılan süreç için geçerlidir. Dosyanın içeriğini inceleyin. Menü için `-Mode Full` kısmını çıkarın.
+Bu, önceden indirdiğiniz yerel scripti çalıştırır; internetten kod indirip çalıştırmaz. ExecutionPolicy seçeneği yalnızca açılan süreç için geçerlidir. Dosyanın içeriğini inceleyin. Varsayılan mod artık **Fast**; tekrar tarama menüsü için `-Mode Menu` kullanın. Eski `-Mode Full` komutu geniş ve uzun taramayı çalıştırmaya devam eder.
 
 ```powershell
+.\DoomsDayFinder.ps1 -Mode Fast
+.\DoomsDayFinder.ps1 -Mode Fast -Path 'D:\CustomInstance\mods'
+.\DoomsDayFinder.ps1 -Mode Menu
 .\DoomsDayFinder.ps1 -Mode Quick
 .\DoomsDayFinder.ps1 -Mode File -Path 'C:\Samples\example.jar'
 .\DoomsDayFinder.ps1 -Mode Runtime
@@ -25,7 +28,23 @@ Bu, önceden indirdiğiniz yerel scripti çalıştırır; internetten kod indiri
 .\DoomsDayFinder.ps1 -Mode SelfTest
 ```
 
-Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kullanıcının Desktop, Downloads, Documents, Temp, LocalAppData ve Roaming dizinlerini inceler. Tüm diskler veya tüm kullanıcı hesapları otomatik taranmaz. Özel kurulumlar için File/ADS modunda açık yol verin. Menüden tekrar tekrar tarama yapılabilir; komut satırı modu sonuçları yazıp çağıran PowerShell'e döner.
+Quick bilinen Minecraft/launcher köklerini; Full bunlara ek olarak geçerli kullanıcının Desktop, Downloads, Documents, Temp, LocalAppData ve Roaming dizinlerini inceler. Tüm diskler veya tüm kullanıcı hesapları otomatik taranmaz. Özel kurulumlar için Fast/File/ADS modunda açık yol verin. Menüden tekrar tekrar tarama yapılabilir; komut satırı modu sonuçları yazıp çağıran PowerShell'e döner.
+
+### 1.4.0 — hedefli Fast modu
+
+Bu mod geniş forensic incelemenin yerine geçen bir tam disk taraması değildir. Tarama kapsamı konsolda ve JSON/TXT raporda açıkça yazılır:
+
+- Önce Java süreçlerinin agent/classpath argümanları ve görülebilen yüklü modül **yolları** toplanır. RAM byte'ları okunmaz; modüllere Authenticode doğrulaması Fast içinde uygulanmaz. Bu seçim imzasız DLL'yi otomatik hile saymaz.
+- Java/Javaw Prefetch kayıtları okunur. Windows'un XPRESS-Huffman açma işlevi PowerShell/.NET Reflection.Emit ile çağrılır; C# derlenmez ve ek EXE/Java runtime indirilmez. SCCA 26/30/31 filename ve volume tabloları, bilinen layout'larda run count ve Java son çalışma zamanları ayrıştırılır. 32 MiB input/expanded güvenlik sınırı vardır; bozuk/erişilemeyen kayıtlar eksik kaynak olarak raporlanır. MAM checksum varsa kontrol edilir.
+- Volume serial bilgisi yalnızca **tek bir mevcut yerel sabit volume** ile eşleştiğinde dosya yolu çözülür. C: varsayılmaz, ağ paylaşımına bağlanılmaz. Kaldırılmış/silinmiş volume, çakışan serial, göreli yol, wildcard ve Java `@argfile` çözümlenmediğinde raporlanır. Volume serial eşleşmesi tarihsel dosya kimliğini kanıtlamaz.
+- Prefetch referanslarının mevcut dosyaları, Java'nın işaret ettiği dosyalar ve bilinen launcher köklerinin doğrudan `mods`, `.minecraft\mods`, `minecraft\mods` klasörleri incelenir. Aktif JVM `--gameDir` mods klasörü ve açıkça verilen `-Path` da eklenir. Launcher'ın tüm instance ağacı/libraries dizini keşfedilmez; özel veya kapalı instance için `-Path` verin.
+- Prefetch referanslarında farklı uzantılara da magic kontrolü yapılır. Adaylarda **30 class ve 200 KB–15 MB elemesi yoktur**. Kurulu imzalar yalnızca byte/hash/resource bilgisine ihtiyaç duyuyorsa constant-pool/ilişki ağacı gereksiz yere üretilmez; bütün class byte'ları yine okunur, hash'lenir ve imzalarla karşılaştırılır. Class/package/ClassShape imzası kuruluysa ayrıştırma otomatik açılır. Rapordaki `ClassParsing` ve `AnalysisProfile` bu ayrımı gösterir; bu profil tam class-format doğrulaması değildir.
+- Nested arşiv, byte pattern, hash, metadata ve temiz hash çelişkisi korunur. **DETECTED öncesindeki bağımsız ikinci okuma her zaman ayrıntılı class ayrıştırmasını da yapar.** Doğrulanmamış topluluk pattern'i kesin tespit olarak sunulmaz.
+- Yalnızca bu hedefli dosya kümesinin ADS'leri incelenir. Normal Zone.Identifier hile değildir. Tüm AppData ADS'leri taranmış sayılmaz.
+- Varsayılan Fast; USN, tarayıcı geçmişi, olay kayıtları ve genel Desktop/AppData gezisi başlatmaz. Prefetch yoksa bunlara sessizce geçmez. Eksik kaynak eksik olarak kalır. Eksik tarihsel dosya `DELETED` sayılmaz; ad benzerliği varsa `REVIEW / UNKNOWN` olur.
+- Mor tek satır gerçek aday toplamını ve aktif işçileri gösterir. Doğrulanmış bir sonuç tamamlandığında dosya yolu final aşamasını beklemeden yazılır. Dosya sayısı, byte boyutu, disk ve Defender incelemesi süreyi etkiler: **30 saniye garantisi yoktur**.
+
+[Örnek alınan topluluk scripti](https://github.com/zedoonvm1/powershell-scripts/blob/main/DoomsDayDetector.ps1) hedefli Prefetch toplaması yanında 30-class ve dosya-boyutu elemesi yapar. Bu eleme ve kesinlik mantığı alınmadı. Yeni Prefetch ayrıştırıcısı [libscca format belgesi](https://github.com/libyal/libscca/blob/main/documentation/Windows%20Prefetch%20File%20%28PF%29%20format.asciidoc) ve [Windows decompression API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-rtldecompressbufferex) temelinde yazıldı. Topluluk scriptinin hız/tespit oranı bağımsız olarak ölçülmedi.
 
 ### 1.3.0 paralel dosya ve ADS analizi
 
@@ -45,7 +64,7 @@ Regresyon testleri dört işçinin gerçekten zaman bakımından örtüşerek ç
 ## Tarama kapsamı
 
 - Uzantı dışında magic bytes kontrolü; tarama köklerindeki farklı uzantılı dosyalarda da ZIP/PE/CLASS başlığı aranır.
-- SHA-256, yeniden okuma ile doğrulama, class constant pool/ilişki indeksi, metadata ve manifest incelemesi.
+- SHA-256, yeniden okuma ile doğrulama, ayrıntılı profilde class constant pool/ilişki indeksi, metadata ve manifest incelemesi.
 - Her JAR entry'sinin byte içerikleri okunur. 30/50/100/1000 class sınırı yoktur.
 - İç içe ZIP/JAR, uzantısı değiştirilmiş embedded archive/class ve embedded native entry hash'leri. Maksimum iç içe derinlik 3.
 - Kaynak listesi fingerprint'i; entry içerik hash'lerinden isim/sıra/sıkıştırmadan bağımsız fingerprint; class adları normalize edilmiş yapısal fingerprint. Yapısal benzerlik tek başına `DETECTED` oluşturmaz; keyfi obfuscation'a dayanıklılık garantisi yoktur.
@@ -117,6 +136,6 @@ Sentetik fixture'lar çalıştırılmaz. Testler ayrı geçici dizinde üretilir
 
 Henüz ölçülmeyenler: gerçek DoomsDay buildleri, bypass'lı örnekler ve OptiFine/Sodium/Lithium/Fabric API/Forge/NeoForge/Iris gibi temiz mod corpus'unda tespit oranı. Doğrulanmış özgün örnekler, kaynak URL/hash ve etiketli temiz corpus olmadan üretim güvenilirliği iddiası yapılmaz.
 
-Tam olarak desteklenmeyenler: RAM içeriği/manual-map/kernel görünürlüğü, şifrelenmiş payload açma, PE içindeki arbitrary embedded container carving, sıkıştırılmış Prefetch içeriği, SQLite download tabloları, SRUM/Amcache/ShimCache kayıt parsing, FRN tabanlı USN rename zinciri, Jump List binary parsing, silinen içeriğin kurtarılması ve eksiksiz forensic timeline. Bunların metadata'sı bazı collector'larda bulunabilir; tam çözümleme değildir. Windows PowerShell 5.1 dizin ADS'lerini bu provider ile enumerate edemez. Loglar varsayılan olarak son 30 gün ile sınırlıdır. Erişilemeyen kaynaklar, reparse noktaları ve parse limitleri raporlanır. PE magic, tam PE doğrulaması veya yürütülebilirlik ispatı değildir.
+Tam olarak desteklenmeyenler: RAM içeriği/manual-map/kernel görünürlüğü, şifrelenmiş payload açma, PE içindeki arbitrary embedded container carving, tüm Prefetch sürümleri ve file-reference/MFT çözümlemesi, SQLite download tabloları, SRUM/Amcache/ShimCache kayıt parsing, FRN tabanlı USN rename zinciri, Jump List binary parsing, silinen içeriğin kurtarılması ve eksiksiz forensic timeline. Fast'ın yeni Java Prefetch parser'ı dışındaki eski Full collector'ı Prefetch için yalnızca metadata/bütünlük bilgisi verir. Bunların metadata'sı bazı collector'larda bulunabilir; tam çözümleme değildir. Windows PowerShell 5.1 dizin ADS'lerini bu provider ile enumerate edemez. Loglar varsayılan olarak son 30 gün ile sınırlıdır. Erişilemeyen kaynaklar, reparse noktaları ve parse limitleri raporlanır. PE magic, tam PE doğrulaması veya yürütülebilirlik ispatı değildir.
 
 Araştırma ve doğrulama politikası: [docs/RESEARCH.md](docs/RESEARCH.md).

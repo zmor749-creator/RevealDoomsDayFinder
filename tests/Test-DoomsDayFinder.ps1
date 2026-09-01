@@ -340,6 +340,187 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
 } else {
     [void]$testResults.Add([pscustomobject]@{ Test='NTFS ADS integration'; Result='NOT RUN'; Error='Windows/NTFS required' })
 }
+function New-PrefetchFixture {
+    param([int]$Version=30,[int]$ReferenceCount=1,[string]$VolumePath='\VOLUME{fixture-volume}',[string]$ReferencePath='\VOLUME{fixture-volume}\Users\ATLAS\renamed.png')
+    $prefix=[byte[]]::new(304)
+    [BitConverter]::GetBytes([uint32]$Version).CopyTo($prefix,0)
+    [Text.Encoding]::ASCII.GetBytes('SCCA').CopyTo($prefix,4)
+    [Text.Encoding]::Unicode.GetBytes('JAVAW.EXE').CopyTo($prefix,16)
+    [BitConverter]::GetBytes([uint32]304).CopyTo($prefix,84)
+    [BitConverter]::GetBytes([uint32]304).CopyTo($prefix,100)
+    [BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc()).CopyTo($prefix,128)
+    [BitConverter]::GetBytes([uint32]7).CopyTo($prefix,208)
+    $references=[Text.StringBuilder]::new()
+    for ($i=0; $i -lt $ReferenceCount; $i++) { [void]$references.Append($ReferencePath); [void]$references.Append([char]0) }
+    $names=[Text.Encoding]::Unicode.GetBytes($references.ToString())
+    $pathBytes=[Text.Encoding]::Unicode.GetBytes($VolumePath)
+    $entrySize=if ($Version -eq 26) { 104 } else { 96 }
+    $volume=[byte[]]::new($entrySize+$pathBytes.Length)
+    [BitConverter]::GetBytes([uint32]$entrySize).CopyTo($volume,0)
+    [BitConverter]::GetBytes([uint32]$VolumePath.Length).CopyTo($volume,4)
+    [BitConverter]::GetBytes([uint32]305419896).CopyTo($volume,16)
+    $pathBytes.CopyTo($volume,$entrySize)
+    [BitConverter]::GetBytes([uint32]($prefix.Length+$names.Length+$volume.Length)).CopyTo($prefix,12)
+    [BitConverter]::GetBytes([uint32]$names.Length).CopyTo($prefix,104)
+    [BitConverter]::GetBytes([uint32]($prefix.Length+$names.Length)).CopyTo($prefix,108)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($prefix,112)
+    [BitConverter]::GetBytes([uint32]$volume.Length).CopyTo($prefix,116)
+    return ,([byte[]]($prefix+$names+$volume))
+}
+
+Test-Case 'Prefetch supported layouts extract Unicode paths, volumes and run count' {
+    $unicodeName='\VOLUME{fixture-volume}\Users\'+[char]0x00D6+'MER ATLAS\renamed.png'
+    foreach ($version in @(26,30,31)) {
+        $r=Read-PrefetchRecord (New-PrefetchFixture -Version $version -ReferencePath $unicodeName)
+        Assert-True ($r.Version -eq $version -and $r.References[0] -eq $unicodeName -and $r.Volumes[0].Serial -eq '12345678' -and $r.RunCount -eq 7 -and $r.LastRunTimesUtc.Count -eq 1)
+    }
+}
+Test-Case 'Prefetch variant 2 uses the correct run-count offset' {
+    $bytes=New-PrefetchFixture -Version 31
+    [BitConverter]::GetBytes([uint32]296).CopyTo($bytes,84)
+    [BitConverter]::GetBytes([uint32]11).CopyTo($bytes,200)
+    Assert-True ((Read-PrefetchRecord $bytes).RunCount -eq 11)
+}
+Test-Case 'Prefetch filenames are not truncated at 1000 entries' {
+    $r=Read-PrefetchRecord (New-PrefetchFixture -ReferenceCount 1847)
+    Assert-True ($r.References.Count -eq 1847)
+}
+Test-Case 'Prefetch invalid bounds and oversized MAM never allocate unchecked output' {
+    $invalid=New-PrefetchFixture
+    [BitConverter]::GetBytes([uint32]2147483647).CopyTo($invalid,104)
+    $failed=$false; try { Read-PrefetchRecord $invalid | Out-Null } catch { $failed=$true }; Assert-True $failed
+    $invalid=[byte[]](77,65,77,4,255,255,255,127,1)
+    $failed=$false; try { Expand-PrefetchBytes $invalid | Out-Null } catch { $failed=$true }; Assert-True $failed
+}
+Test-Case 'Prefetch volume mapping never guesses C or ambiguous serials' {
+    $r=Read-PrefetchRecord (New-PrefetchFixture)
+    $volumes=@([pscustomobject]@{ Root='D:\'; Serial='12345678' })
+    Assert-True ((Resolve-PrefetchReference $r.References[0] $r.Volumes $volumes) -eq 'D:\Users\ATLAS\renamed.png')
+    Assert-True ($null -eq (Resolve-PrefetchReference $r.References[0] $r.Volumes @()))
+    $volumes += [pscustomobject]@{ Root='C:\'; Serial='12345678' }
+    Assert-True ($null -eq (Resolve-PrefetchReference $r.References[0] $r.Volumes $volumes))
+    Assert-True ($null -eq (Resolve-PrefetchReference '\\server\share\payload.jar' @() $volumes))
+}
+Test-Case 'Fast profile inspects every class byte without unnecessary constant-pool work' {
+    Set-TestDatabase @((New-TestSignature String 'fixture-only-marker-7fe56cd1' 'fixture' $false))
+    $large=New-TestArchive 'fast-large.jar' 1847 @{ 'last/payload.dat'=[Text.Encoding]::UTF8.GetBytes('fixture-only-marker-7fe56cd1') }
+    $script:AnalysisProfile='Signatures'
+    try {
+        $r=Inspect-TestFile $large
+        Assert-True ($r.State.FilesFullyScanned -eq 1 -and $r.Finding.ArchiveAnalysis.ClassesAnalyzed -eq 1847 -and $r.Finding.Evidence.Count -eq 1)
+        Assert-True ($r.Finding.ArchiveAnalysis.ClassShapeFingerprint -eq '' -and $r.Finding.Verdict -ne 'DETECTED')
+    } finally { $script:AnalysisProfile='Detailed' }
+}
+Test-Case 'Fast automatically parses class names when installed signatures need them' {
+    Set-TestDatabase @((New-TestSignature Class 'fixture.C0' 'fixture' $false))
+    $script:AnalysisProfile='Signatures'
+    try {
+        $r=Inspect-TestFile $plain
+        Assert-True ($r.Finding.Evidence.Count -eq 1 -and $r.Finding.ArchiveAnalysis.ClassParsing -eq 'Detailed')
+    } finally { $script:AnalysisProfile='Detailed' }
+}
+Test-Case 'Fast independent verification still rejects malformed classes' {
+    $file=New-TestArchive 'fast-malformed.jar' 0 @{ 'broken.class'=[byte[]](0xCA,0xFE,0xBA,0xBE) }
+    Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $file)))
+    $script:AnalysisProfile='Signatures'
+    try {
+        $r=Inspect-TestFile $file
+        Assert-True ($r.Finding.Verdict -eq 'INCONCLUSIVE' -and $r.Finding.VerificationStatus -eq 'CONFLICTING')
+    } finally { $script:AnalysisProfile='Detailed' }
+}
+Test-Case 'Fast parallel profile is transferred to workers without changing verification rules' {
+    Set-TestDatabase @((New-TestSignature SHA256 (Get-CachedFileSha256 $plain)))
+    $script:AnalysisProfile='Signatures'
+    try {
+        $s=New-ScanState Fast
+        Invoke-ParallelInspection -Files @($plain) -State $s -WorkerLimit 2 | Out-Null
+        Assert-True ($s.Findings.Count -eq 1 -and $s.Findings[0].Verdict -eq 'DETECTED' -and $s.Findings[0].VerificationStatus -eq 'VERIFIED')
+        Assert-True ($s.Evidence[0].ClassParsing -like 'All class bytes*')
+    } finally { $script:AnalysisProfile='Detailed' }
+}
+Test-Case 'Fast has no broad-directory or USN fallback when evidence is absent' {
+    Set-TestDatabase
+    function Get-FastLocalVolumes { param($State); return @() }
+    function Get-FastRuntimeCandidates { param($State,$Candidates,$Hosts,$ModRoots,$CurrentVolumes); Add-SourceStatus $State 'Java' $true 'No running Java' }
+    function Get-FastPrefetchCandidates { param($State,$Candidates,$Hosts,$CurrentVolumes); Add-SourceStatus $State 'Prefetch' $false 'Unavailable' }
+    function Get-MinecraftLocations { return @() }
+    function Get-DefaultAdsRoots { throw 'Unexpected broad roots' }
+    function Get-UsnJournalEvidence { throw 'Unexpected USN read' }
+    function Get-ReadOnlyFiles { throw 'Unexpected broad traversal' }
+    function Export-ScanReport { param($State) }
+    $s=Invoke-ScanMode Fast
+    Assert-True ($s.AnalysisProfile -eq 'Signatures' -and $script:AnalysisProfile -eq 'Detailed' -and $s.CandidateFiles -eq 0 -and $s.UnavailableSources.Count -gt 0)
+}
+
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    function Compress-PrefetchFixture {
+        param([byte[]]$Bytes,[switch]$Checksum)
+        # Test-only Windows compression binding creates synthetic, non-executable data.
+        $name=[Reflection.AssemblyName]::new('RevealFixture_'+[guid]::NewGuid().ToString('N'))
+        $a=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name,[Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $t=$a.DefineDynamicModule($name.Name).DefineType('FixtureCompression',[Reflection.TypeAttributes]::Public)
+        $m=$t.DefinePInvokeMethod('RtlCompressBuffer',(Join-Path ([Environment]::SystemDirectory) 'ntdll.dll'),'RtlCompressBuffer',([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl),[Reflection.CallingConventions]::Standard,[uint32],[Type[]]@([uint16],[IntPtr],[uint32],[IntPtr],[uint32],[uint32],[uint32].MakeByRefType(),[IntPtr]),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Ansi)
+        $m.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig); $compressor=$t.CreateType()
+        $api=Get-PrefetchNativeApi
+        [uint32]$ws=0; [uint32]$fragment=0
+        Assert-True ($api::RtlGetCompressionWorkSpaceSize(4,[ref]$ws,[ref]$fragment) -eq 0)
+        $source=[IntPtr]::Zero; $destination=[IntPtr]::Zero; $workspace=[IntPtr]::Zero
+        try {
+            $source=[Runtime.InteropServices.Marshal]::AllocHGlobal($Bytes.Length)
+            $destination=[Runtime.InteropServices.Marshal]::AllocHGlobal($Bytes.Length*2+4096)
+            $workspace=[Runtime.InteropServices.Marshal]::AllocHGlobal([int]$ws)
+            [Runtime.InteropServices.Marshal]::Copy($Bytes,0,$source,$Bytes.Length)
+            [uint32]$written=0
+            $status=$compressor::RtlCompressBuffer(4,$source,[uint32]$Bytes.Length,$destination,[uint32]($Bytes.Length*2+4096),4096,[ref]$written,$workspace)
+            Assert-True ($status -eq 0) ('Synthetic compression failed: '+$status)
+            $headerSize=if ($Checksum) { 12 } else { 8 }
+            $result=[byte[]]::new($headerSize+$written)
+            [byte[]](77,65,77,4) | ForEach-Object -Begin { $i=0 } -Process { $result[$i++]=$_ }
+            [BitConverter]::GetBytes([uint32]$Bytes.Length).CopyTo($result,4)
+            [Runtime.InteropServices.Marshal]::Copy($destination,$result,$headerSize,[int]$written)
+            if ($Checksum) { $result[3]=132; [BitConverter]::GetBytes([uint32]$api::RtlComputeCrc32(0,$result,[uint32]$result.Length)).CopyTo($result,8) }
+            return ,$result
+        } finally { foreach ($p in @($source,$destination,$workspace)) { if ($p -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($p) } } }
+    }
+    Test-Case 'Windows MAM decompression round-trip with and without checksum' {
+        $plainPf=New-PrefetchFixture -ReferenceCount 7
+        foreach ($crc in @($false,$true)) {
+            $packed=Compress-PrefetchFixture $plainPf -Checksum:$crc
+            $expanded=Expand-PrefetchBytes $packed
+            Assert-True ([Convert]::ToBase64String($expanded) -ceq [Convert]::ToBase64String($plainPf))
+            Assert-True ((Read-PrefetchRecord $packed).References.Count -eq 7)
+        }
+        $packed[8]=$packed[8] -bxor 1
+        $failed=$false; try { Expand-PrefetchBytes $packed | Out-Null } catch { $failed=$true }; Assert-True $failed
+    }
+    Test-Case 'Fast Prefetch collector sees renamed tiny JARs with more than 30 classes' {
+        Set-TestDatabase
+        $dir=Join-Path $testDirectory 'pf'; [void][IO.Directory]::CreateDirectory($dir)
+        $jar=New-TestArchive 'prefetch-renamed.png' 35
+        $localRoot=[IO.Path]::GetPathRoot($jar)
+        $r=New-PrefetchFixture -ReferencePath $jar
+        [IO.File]::WriteAllBytes((Join-Path $dir 'JAVAW.EXE-12345678.pf'),(Compress-PrefetchFixture $r))
+        $s=New-ScanState Fast; $c=[Collections.Generic.HashSet[string]]::new(); $h=[Collections.Generic.HashSet[string]]::new()
+        Get-FastPrefetchCandidates $s $c $h @([pscustomobject]@{ Root=$localRoot; Serial='12345678' }) $dir
+        Assert-True ($c.Count -eq 1 -and $c.Contains($jar) -and $s.FilesSkipped -eq 0 -and $s.UnavailableSources.Count -eq 0)
+    }
+    Test-Case 'Fast missing reference is REVIEW and not DELETED or DETECTED' {
+        Set-TestDatabase
+        $missing=Join-Path $testDirectory 'DoomsDay-missing.jar'
+        $s=New-ScanState Fast; $c=[Collections.Generic.HashSet[string]]::new(); $h=[Collections.Generic.HashSet[string]]::new()
+        Add-FastCandidate $missing 'Java Prefetch reference' $s $c $h @([pscustomobject]@{ Root=[IO.Path]::GetPathRoot($missing); Serial='12345678' })
+        Assert-True ($s.Findings.Count -eq 1 -and $s.Findings[0].Verdict -eq 'REVIEW' -and $s.Findings[0].Status -eq 'UNKNOWN' -and $c.Count -eq 0)
+    }
+    Test-Case 'Fast candidate collection does not exclude files above 15 MiB' {
+        Set-TestDatabase
+        $file=Join-Path $testDirectory 'large-candidate.bin'
+        $stream=[IO.File]::Create($file); try { $stream.SetLength(16MB) } finally { $stream.Dispose() }
+        $s=New-ScanState Fast; $c=[Collections.Generic.HashSet[string]]::new(); $h=[Collections.Generic.HashSet[string]]::new()
+        Add-FastCandidate $file 'Java Prefetch reference' $s $c $h @([pscustomobject]@{ Root=[IO.Path]::GetPathRoot($file); Serial='12345678' })
+        Assert-True ($c.Contains($file) -and $s.FilesSkipped -eq 0)
+    }
+} else { [void]$testResults.Add([pscustomobject]@{ Test='Windows MAM and targeted collectors'; Result='NOT RUN'; Error='Windows required' }) }
+
 $resultPath=Join-Path $testDirectory 'test-results.json'
 [IO.File]::WriteAllText($resultPath,($testResults | ConvertTo-Json -Depth 5))
 Write-Host "Test results: $resultPath"

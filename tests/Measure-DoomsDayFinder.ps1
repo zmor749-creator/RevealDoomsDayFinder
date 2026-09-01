@@ -1,8 +1,9 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([string]$ScannerPath=(Join-Path $PSScriptRoot '..\DoomsDayFinder.ps1'),[int]$ClassCount=300,[int]$ConstantsPerClass=1000)
+param([string]$ScannerPath=(Join-Path $PSScriptRoot '..\DoomsDayFinder.ps1'),[int]$ClassCount=300,[int]$ConstantsPerClass=1000,[ValidateSet('Detailed','Signatures')][string]$Profile='Detailed')
 $ErrorActionPreference='Stop'
 . $ScannerPath
+$script:AnalysisProfile=$Profile
 Import-DoomsDaySignatures | Out-Null
 $root=Join-Path ([IO.Path]::GetTempPath()) ('RevealBenchmark-'+[guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($root)
@@ -35,4 +36,4 @@ $repeat=Join-Path $root 'same-content-renamed.jar';[IO.File]::Copy($path,$repeat
 $repeatTimer=[Diagnostics.Stopwatch]::StartNew()
 $second=Invoke-FileInspection -LiteralPath $repeat -State $state -AlwaysRecord -QuietProgress
 $repeatTimer.Stop()
-[pscustomobject]@{ Version=$script:ToolVersion; Classes=$ClassCount; ConstantsPerClass=$ConstantsPerClass; FirstSeconds=[Math]::Round($timer.Elapsed.TotalSeconds,3); RepeatedContentSeconds=[Math]::Round($repeatTimer.Elapsed.TotalSeconds,3); ClassesAnalyzed=$second.ArchiveAnalysis.ClassesAnalyzed; ContentFingerprint=$first.ArchiveAnalysis.ContentFingerprint; ClassShapeFingerprint=$first.ArchiveAnalysis.ClassShapeFingerprint; Verdict=$first.Verdict; Root=$root } | ConvertTo-Json
+[pscustomobject]@{ Version=$script:ToolVersion; Profile=$Profile; Classes=$ClassCount; ConstantsPerClass=$ConstantsPerClass; FirstSeconds=[Math]::Round($timer.Elapsed.TotalSeconds,3); RepeatedContentSeconds=[Math]::Round($repeatTimer.Elapsed.TotalSeconds,3); ClassesAnalyzed=$second.ArchiveAnalysis.ClassesAnalyzed; ContentFingerprint=$first.ArchiveAnalysis.ContentFingerprint; ClassShapeFingerprint=$first.ArchiveAnalysis.ClassShapeFingerprint; Verdict=$first.Verdict; Root=$root } | ConvertTo-Json

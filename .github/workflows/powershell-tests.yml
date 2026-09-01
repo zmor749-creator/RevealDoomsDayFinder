@@ -19,3 +19,6 @@ jobs:
       - name: Windows PowerShell synthetic performance sample
         shell: powershell
         run: ./tests/Measure-DoomsDayFinder.ps1
+      - name: Windows PowerShell targeted profile performance sample
+        shell: powershell
+        run: ./tests/Measure-DoomsDayFinder.ps1 -Profile Signatures

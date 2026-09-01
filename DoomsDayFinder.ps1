@@ -10,8 +10,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Quick','Full','File','ADS','Runtime','Update','Export','SelfTest')]
-    [string]$Mode = 'Menu',
+    [ValidateSet('Menu','Fast','Quick','Full','File','ADS','Runtime','Update','Export','SelfTest')]
+    [string]$Mode = 'Fast',
     [string]$Path,
     [switch]$Deep,
     [switch]$NoPause,
@@ -24,7 +24,9 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-$script:ToolVersion = '1.3.0'
+$script:ToolVersion = '1.4.0'
+$script:AnalysisProfile = 'Detailed'
+$script:PrefetchNativeApi = $null
 $script:ScannerScriptPath = $MyInvocation.MyCommand.Path
 $script:WorkerCount = $Workers
 $script:IsWorker = $false
@@ -73,6 +75,8 @@ function New-ScanState {
         ToolVersion = $script:ToolVersion
         ScanId = [guid]::NewGuid().ToString()
         Mode = $ScanMode
+        AnalysisProfile = $script:AnalysisProfile
+        Scope = ''
         StartedUtc = [DateTime]::UtcNow
         CompletedUtc = $null
         IsAdministrator = Test-IsAdministrator
@@ -585,7 +589,7 @@ function Get-ContentScanPlan {
 
 function Read-ContentInspection {
     param([IO.Stream]$Stream, [object[]]$Signatures = @(), [long]$MaximumBytes = [long]::MaxValue,
-        [switch]$Capture, [switch]$CaptureContainers, $Budget, $Plan)
+        [switch]$Capture, [switch]$CaptureContainers, $Budget, $Plan, [switch]$SkipClassCapture)
     if ($null -eq $Plan) { $Plan=Get-ContentScanPlan $Signatures }
     $encoding=$Plan.Encoding; $patterns=$Plan.Patterns; $overlap=$Plan.Overlap
     $found = @{}
@@ -615,7 +619,7 @@ function Read-ContentInspection {
             if ($total -eq $count) {
                 $magic = Get-MagicInfoFromStream $prefix ''
                 $actualType = $magic.ActualType
-                if ($Capture -or ($CaptureContainers -and $actualType -in @('Java Archive / ZIP','Java Class'))) { $memory = [IO.MemoryStream]::new() }
+                if ($Capture -or ($CaptureContainers -and ($actualType -eq 'Java Archive / ZIP' -or ($actualType -eq 'Java Class' -and -not $SkipClassCapture)))) { $memory = [IO.MemoryStream]::new() }
             }
             if ($null -ne $memory) {
                 if ($total -le $script:Limits.MaximumNestedEntryBytes) { $memory.Write($buffer,0,$count) }
@@ -767,7 +771,7 @@ function Inspect-ZipStream {
         Resources=[Collections.ArrayList]::new(); Embedded=[Collections.ArrayList]::new()
         Metadata=[ordered]@{}; Manifest=[ordered]@{}; StructuralFingerprint=''; ContentFingerprint=''; ClassShapeFingerprint=''
         ClassRelationships=[Collections.ArrayList]::new(); EntryHashes=[Collections.ArrayList]::new()
-        Matches=[Collections.ArrayList]::new(); AllEntriesScanned=$false; SecurityLimitHit=$false
+        Matches=[Collections.ArrayList]::new(); AllEntriesScanned=$false; SecurityLimitHit=$false; ClassParsing='Detailed'
     }
     if ($Depth -gt $script:Limits.MaximumRecursion) { $result.SecurityLimitHit=$true; return $result }
     if ($Stream.CanSeek) { $Stream.Position=0 }
@@ -787,6 +791,9 @@ function Inspect-ZipStream {
         }
         $classSigs=@(Get-SignaturesByType @('Class'))
         $packageSigs=@(Get-SignaturesByType @('Package'))
+        $shapeSigs=@(Get-SignaturesByType @('StructuralFingerprint') | Where-Object { $_.PSObject.Properties['FingerprintKind'] -and $_.FingerprintKind -eq 'ClassShape' })
+        $parseClasses=$Independent -or $script:AnalysisProfile -ne 'Signatures' -or $classSigs.Count -gt 0 -or $packageSigs.Count -gt 0 -or $shapeSigs.Count -gt 0
+        if (-not $parseClasses) { $result.ClassParsing='All class bytes inspected; constant-pool parsing not requested by installed signatures' }
         $resourceSigs=@(Get-SignaturesByType @('Resource','EmbeddedNative'))
         $metadataSigs=@(Get-SignaturesByType @('Manifest','ModId','LoaderIndicator'))
         $contentSigs=@(Get-SignaturesByType @('String','ByteSequence','LoaderIndicator','RuntimeIndicator'))
@@ -803,7 +810,7 @@ function Inspect-ZipStream {
             $isClass=$name.EndsWith('.class',[StringComparison]::OrdinalIgnoreCase)
             if ($isClass) { $result.ClassCount++ }
             $entryStream=$entry.Open()
-            try { $content=Read-ContentInspection -Stream $entryStream -Signatures $contentSigs -Plan $contentPlan -MaximumBytes $entry.Length -Capture:$isMetadata -CaptureContainers -Budget $Budget }
+            try { $content=Read-ContentInspection -Stream $entryStream -Signatures $contentSigs -Plan $contentPlan -MaximumBytes $entry.Length -Capture:$isMetadata -CaptureContainers -Budget $Budget -SkipClassCapture:(-not $parseClasses) }
             finally { $entryStream.Dispose() }
             if ($content.Length -ne $entry.Length) { throw [IO.InvalidDataException]::new("ZIP entry length mismatch: $name") }
             foreach ($sig in $content.Matches) { Add-SignatureMatch $result.Matches $sig $location '[byte content match]' }
@@ -812,7 +819,8 @@ function Inspect-ZipStream {
             foreach ($sig in $resourceSigs) { if (Test-TextMatch $name $sig) { Add-SignatureMatch $result.Matches $sig $location $name } }
             if ($isClass -or $content.ActualType -eq 'Java Class') {
                 if (-not $isClass) { $result.ClassCount++ }
-                try {
+                if (-not $parseClasses) { $result.ClassesAnalyzed++ }
+                else { try {
                     if ($null -eq $content.Bytes) { throw 'Class exceeds in-memory parsing safety budget.' }
                     $class=Get-CachedClassIndex -Bytes $content.Bytes -SHA256 $content.SHA256 -Independent:$Independent
                     $className=$class.Name.Replace('/','.')
@@ -828,7 +836,7 @@ function Inspect-ZipStream {
                 } catch {
                     $result.SecurityLimitHit=$true
                     if ($null -ne $State) { Add-ScanWarning $State 'CLASS' $_.Exception.Message $location }
-                }
+                } }
             }
             if ($isMetadata) {
                 if ($entry.Length -gt $script:Limits.MaximumMetadataBytes -or $null -eq $content.Bytes) {
@@ -860,7 +868,7 @@ function Inspect-ZipStream {
         $structure=(@($result.Resources | Sort-Object -Unique) -join "|") + '|manifest|' + (@($result.Manifest.Keys | Sort-Object) -join '|')
         $result.StructuralFingerprint=Get-StringSha256 $structure
         $result.ContentFingerprint=Get-StringSha256 (@($result.EntryHashes | ForEach-Object { $_.SHA256 } | Sort-Object) -join '|')
-        $result.ClassShapeFingerprint=Get-StringSha256 (@($shapes | Sort-Object) -join '|')
+        if ($parseClasses) { $result.ClassShapeFingerprint=Get-StringSha256 (@($shapes | Sort-Object) -join '|') }
         foreach ($sig in @(Get-SignaturesByType @('StructuralFingerprint'))) {
             $observed=$result.StructuralFingerprint
             if ($sig.PSObject.Properties['FingerprintKind']) {
@@ -1132,7 +1140,7 @@ function Invoke-FileInspection {
         else { $finding.Verdict='INCONCLUSIVE'; $finding.VerificationStatus='UNVERIFIED'; $finding.DetectionReasons += 'Archive parsing was incomplete.' }
         if ($null -ne $jar) {
             $finding | Add-Member -NotePropertyName ArchiveAnalysis -NotePropertyValue $jar
-            [void]$State.Evidence.Add([pscustomobject]@{ Source='Archive Inspection'; Path=$item.FullName; SHA256=$sha256; ClassCount=$jar.ClassCount; ClassesAnalyzed=$jar.ClassesAnalyzed; ContentFingerprint=$jar.ContentFingerprint; ClassShapeFingerprint=$jar.ClassShapeFingerprint; Complete=$jar.AllEntriesScanned })
+            [void]$State.Evidence.Add([pscustomobject]@{ Source='Archive Inspection'; Path=$item.FullName; SHA256=$sha256; ClassCount=$jar.ClassCount; ClassesAnalyzed=$jar.ClassesAnalyzed; ClassParsing=$jar.ClassParsing; ContentFingerprint=$jar.ContentFingerprint; ClassShapeFingerprint=$jar.ClassShapeFingerprint; Complete=$jar.AllEntriesScanned })
         }
         $recordFinding=$AlwaysRecord -or $finding.Verdict -ne 'INFO' -or $filenameMatch -or $magic.ExtensionMismatch
         if ($recordFinding) { [void]$State.Findings.Add($finding) }
@@ -1286,6 +1294,7 @@ function Initialize-ScannerWorker {
     $script:IsWorker=$true; $script:WorkerCancellation=$Token
     $script:WorkerAdministrator=[bool]$config.IsAdministrator
     $script:ToolVersion=$config.ToolVersion; $script:ProjectRoot=$config.ProjectRoot
+    $script:AnalysisProfile=[string]$config.AnalysisProfile
     $script:Signatures=$config.Signatures; $script:GenericIndicators=@($config.GenericIndicators)
     $script:Limits=[ordered]@{}
     foreach ($property in $config.Limits.PSObject.Properties) { $script:Limits[$property.Name]=$property.Value }
@@ -1341,6 +1350,13 @@ function Merge-WorkerResult {
     foreach ($name in @('Findings','Evidence','Integrity','Processes','AnalyzedSources','UnavailableSources')) {
         foreach ($record in $part.$name) { [void]$State.$name.Add($record) }
     }
+    if ($State.Mode -eq 'Fast') {
+        foreach ($finding in $part.Findings) {
+            if ($finding.Verdict -eq 'DETECTED' -and $finding.VerificationStatus -eq 'VERIFIED') {
+                Write-Color ("[DETECTED / VERIFIED] {0} | {1} | {2}" -f $finding.Path,$finding.Category,$finding.SHA256) Red
+            }
+        }
+    }
     foreach ($warning in $part.Warnings) { Add-ScanWarning $State $warning.Source $warning.Message $warning.Path }
     foreach ($key in $Result.InspectionCache.Keys) { $script:InspectionCache[$key]=$Result.InspectionCache[$key] }
     foreach ($key in $Result.HashCache.Keys) { $script:HashCache[$key]=$Result.HashCache[$key] }
@@ -1368,7 +1384,7 @@ function Invoke-ParallelInspection {
             $initial.Commands.Add([Management.Automation.Runspaces.SessionStateFunctionEntry]::new($function.Name,$function.Definition))
         }
     }
-    $configuration=[pscustomobject]@{ ToolVersion=$script:ToolVersion; ProjectRoot=$script:ProjectRoot; Signatures=$script:Signatures; GenericIndicators=$script:GenericIndicators; Limits=$script:Limits; IsAdministrator=$State.IsAdministrator } | ConvertTo-Json -Depth 20 -Compress
+    $configuration=[pscustomobject]@{ ToolVersion=$script:ToolVersion; ProjectRoot=$script:ProjectRoot; AnalysisProfile=$script:AnalysisProfile; Signatures=$script:Signatures; GenericIndicators=$script:GenericIndicators; Limits=$script:Limits; IsAdministrator=$State.IsAdministrator } | ConvertTo-Json -Depth 20 -Compress
     $tasks=[Collections.Concurrent.ConcurrentQueue[object]]::new()
     $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($file in $Files) { if ($seen.Add($file)) { $tasks.Enqueue($file) } }
@@ -2210,6 +2226,271 @@ function Get-OracleUsageEvidence {
     }
 }
 
+function Get-PrefetchNativeApi {
+    if ($null -ne $script:PrefetchNativeApi) { return $script:PrefetchNativeApi }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'MAM decompression requires Windows.' }
+    # Only documented decompression plus the Windows CRC routine; no C# compiler.
+    $name=[Reflection.AssemblyName]::new('RevealPrefetch_'+[guid]::NewGuid().ToString('N'))
+    $assembly=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name,[Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module=$assembly.DefineDynamicModule($name.Name)
+    $type=$module.DefineType('RevealPrefetchApi',([Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed))
+    $attributes=[Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
+    $definitions=@(
+        @{ Name='RtlGetCompressionWorkSpaceSize'; Parameters=[Type[]]@([uint16],[uint32].MakeByRefType(),[uint32].MakeByRefType()) },
+        @{ Name='RtlDecompressBufferEx'; Parameters=[Type[]]@([uint16],[IntPtr],[uint32],[IntPtr],[uint32],[uint32].MakeByRefType(),[IntPtr]) },
+        @{ Name='RtlComputeCrc32'; Parameters=[Type[]]@([uint32],[byte[]],[uint32]) }
+    )
+    foreach ($definition in $definitions) {
+        $method=$type.DefinePInvokeMethod($definition.Name,(Join-Path ([Environment]::SystemDirectory) 'ntdll.dll'),$definition.Name,$attributes,
+            [Reflection.CallingConventions]::Standard,[uint32],$definition.Parameters,
+            [Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Ansi)
+        $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    $script:PrefetchNativeApi=$type.CreateType()
+    return $script:PrefetchNativeApi
+}
+
+function Expand-PrefetchBytes {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -lt 8 -or $Bytes.Length -gt 32MB) { throw 'Prefetch length outside parser safety bounds.' }
+    if ([Text.Encoding]::ASCII.GetString($Bytes,0,3) -ne 'MAM') { return ,$Bytes }
+    $format=$Bytes[3] -band 127
+    if ($format -ne 4) { throw 'Unsupported MAM compression format.' }
+    $expanded=[BitConverter]::ToUInt32($Bytes,4)
+    if ($expanded -lt 8 -or $expanded -gt 32MB) { throw 'MAM expanded-size safety limit exceeded.' }
+    $offset=8
+    $api=Get-PrefetchNativeApi
+    if (($Bytes[3] -band 128) -ne 0) {
+        if ($Bytes.Length -lt 13) { throw 'Truncated MAM checksum header.' }
+        $expected=[BitConverter]::ToUInt32($Bytes,8)
+        $check=[byte[]]$Bytes.Clone(); [Array]::Clear($check,8,4)
+        if ($api::RtlComputeCrc32(0,$check,[uint32]$check.Length) -ne $expected) { throw 'MAM checksum mismatch.' }
+        $offset=12
+    }
+    if ($Bytes.Length -le $offset) { throw 'MAM compressed block missing.' }
+    [uint32]$compressionWorkspace=0; [uint32]$fragmentWorkspace=0
+    if ($api::RtlGetCompressionWorkSpaceSize(4,[ref]$compressionWorkspace,[ref]$fragmentWorkspace) -ne 0) { throw 'Windows decompression workspace unavailable.' }
+    $workspaceSize=[Math]::Max($compressionWorkspace,$fragmentWorkspace)
+    if ($workspaceSize -lt 1 -or $workspaceSize -gt 32MB) { throw 'Invalid decompression workspace size.' }
+    $inputMemory=[IntPtr]::Zero; $outputMemory=[IntPtr]::Zero; $workspace=[IntPtr]::Zero
+    try {
+        $length=$Bytes.Length-$offset
+        $inputMemory=[Runtime.InteropServices.Marshal]::AllocHGlobal($length)
+        $outputMemory=[Runtime.InteropServices.Marshal]::AllocHGlobal([int]$expanded)
+        $workspace=[Runtime.InteropServices.Marshal]::AllocHGlobal([int]$workspaceSize)
+        [Runtime.InteropServices.Marshal]::Copy($Bytes,$offset,$inputMemory,$length)
+        [uint32]$written=0
+        $status=$api::RtlDecompressBufferEx(4,$outputMemory,$expanded,$inputMemory,[uint32]$length,[ref]$written,$workspace)
+        if ($status -ne 0 -or $written -ne $expanded) { throw ('MAM decompression failed: status 0x{0:X8}; output {1}/{2}.' -f $status,$written,$expanded) }
+        $output=[byte[]]::new([int]$expanded)
+        [Runtime.InteropServices.Marshal]::Copy($outputMemory,$output,0,$output.Length)
+        return ,$output
+    } finally {
+        foreach ($pointer in @($inputMemory,$outputMemory,$workspace)) { if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($pointer) } }
+    }
+}
+
+function Read-PrefetchRecord {
+    param([byte[]]$Bytes)
+    $data=Expand-PrefetchBytes $Bytes
+    if ($data.Length -lt 208 -or [Text.Encoding]::ASCII.GetString($data,4,4) -ne 'SCCA') { throw 'Invalid or truncated SCCA header.' }
+    $version=[BitConverter]::ToUInt32($data,0)
+    if ($version -notin @(26,30,31)) { throw "Unsupported Prefetch version: $version" }
+    $declared=[BitConverter]::ToUInt32($data,12)
+    if ($declared -ne $data.Length) { throw 'SCCA declared file size does not match decompressed length.' }
+    $offset=[long][BitConverter]::ToUInt32($data,100); $size=[long][BitConverter]::ToUInt32($data,104)
+    if ($offset -lt 208 -or $size -lt 2 -or $size%2 -ne 0 -or $offset+$size -gt $data.Length) { throw 'Invalid Prefetch filename section.' }
+    $text=[Text.UnicodeEncoding]::new($false,$false,$true).GetString($data,[int]$offset,[int]$size)
+    if (-not $text.EndsWith([string][char]0)) { throw 'Unterminated Prefetch filename section.' }
+    $references=@($text.Split([char]0) | Where-Object { $_.Length -gt 0 })
+    $volumeOffset=[long][BitConverter]::ToUInt32($data,108)
+    $volumeCount=[long][BitConverter]::ToUInt32($data,112)
+    $volumeSize=[long][BitConverter]::ToUInt32($data,116)
+    $recordSize=if ($version -eq 26) { 104L } else { 96L }
+    if ($volumeCount -gt 1024 -or $volumeCount*$recordSize -gt $volumeSize -or $volumeOffset+$volumeSize -gt $data.Length) { throw 'Invalid Prefetch volume table.' }
+    if ($volumeCount -gt 0 -and $volumeOffset -lt 208) { throw 'Prefetch volume table overlaps the header.' }
+    $volumes=[Collections.Generic.List[object]]::new()
+    for ($i=0; $i -lt $volumeCount; $i++) {
+        $entry=[int]($volumeOffset+$i*$recordSize)
+        $pathOffset=[long][BitConverter]::ToUInt32($data,$entry)
+        $pathSize=2L*[BitConverter]::ToUInt32($data,$entry+4)
+        if ($pathOffset -lt $volumeCount*$recordSize -or $pathSize -le 0 -or $pathOffset+$pathSize -gt $volumeSize) { throw 'Invalid Prefetch volume path.' }
+        $volumePath=[Text.Encoding]::Unicode.GetString($data,[int]($volumeOffset+$pathOffset),[int]$pathSize).TrimEnd([char]0)
+        $volumes.Add([pscustomobject]@{ DevicePath=$volumePath; Serial=('{0:X8}' -f [BitConverter]::ToUInt32($data,$entry+16)); CreatedFileTime=[BitConverter]::ToInt64($data,$entry+8) })
+    }
+    $times=[Collections.Generic.List[DateTime]]::new()
+    for ($i=0; $i -lt 8; $i++) {
+        $fileTime=[BitConverter]::ToInt64($data,128+8*$i)
+        if ($fileTime -gt 0) { $times.Add([DateTime]::FromFileTimeUtc($fileTime)) }
+    }
+    $metricsOffset=[BitConverter]::ToUInt32($data,84)
+    $runCount=$null
+    if ($metricsOffset -eq 296 -and $version -in @(30,31)) { $runCount=[BitConverter]::ToUInt32($data,200) }
+    elseif ($metricsOffset -eq 304 -and $data.Length -ge 212) { $runCount=[BitConverter]::ToUInt32($data,208) }
+    [pscustomobject]@{ Version=$version; Executable=[Text.Encoding]::Unicode.GetString($data,16,60).TrimEnd([char]0); RunCount=$runCount; LastRunTimesUtc=$times.ToArray(); References=$references; Volumes=$volumes.ToArray() }
+}
+
+function Get-FastLocalVolumes {
+    param($State)
+    try {
+        foreach ($disk in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop)) {
+            [pscustomobject]@{ Root=([string]$disk.DeviceID+'\'); Serial=([string]$disk.VolumeSerialNumber).Replace('-','').ToUpperInvariant().PadLeft(8,'0') }
+        }
+    } catch { Add-SourceStatus $State 'Local volume mapping' $false $_.Exception.Message; Add-ScanWarning $State 'VOLUME' $_.Exception.Message }
+}
+
+function Resolve-PrefetchReference {
+    param([string]$Reference,[object[]]$PrefetchVolumes,[object[]]$CurrentVolumes)
+    if ($Reference -match '^[A-Za-z]:\\') {
+        if (@($CurrentVolumes | Where-Object { $_.Root -ieq $Reference.Substring(0,3) }).Count -eq 1 -and $Reference -notmatch '(?:^|\\)\.\.(?:\\|$)') { return $Reference }
+        return $null
+    }
+    foreach ($volume in $PrefetchVolumes) {
+        $prefix=$volume.DevicePath.TrimEnd('\')+'\'
+        if ($Reference.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+            $matches=@($CurrentVolumes | Where-Object { $_.Serial -eq $volume.Serial -and $_.Serial -ne '00000000' })
+            # No guessed C: path and no filename-only correlation across drives.
+            if ($matches.Count -ne 1) { return $null }
+            $relative=$Reference.Substring($prefix.Length)
+            if ($relative -match '(^|\\)\.\.(\\|$)|:' -or $relative.StartsWith('\')) { return $null }
+            return $matches[0].Root+$relative
+        }
+    }
+    return $null
+}
+
+function Add-FastCandidate {
+    param([string]$Candidate,[string]$Source,$State,$Candidates,$Hosts,[object[]]$CurrentVolumes,[int]$ProcessId=0,[string]$Artifact='')
+    if (-not $Candidate) { return }
+    $record=[pscustomobject]@{ Source=$Source; Path=$Candidate; PID=$ProcessId; Artifact=$Artifact; CurrentFileExists=$false; TimeCreatedUtc=$null; Note='Reference only; not proof of payload execution or DoomsDay.' }
+    [void]$State.Evidence.Add($record)
+    # Do not connect to shares or resolve relative paths against this scanner's cwd.
+    $local=($Candidate -match '^[A-Za-z]:\\' -and @($CurrentVolumes | Where-Object { $_.Root -ieq $Candidate.Substring(0,3) }).Count -eq 1)
+    if (-not $local -or $Candidate -match '[*?]|(?:^|\\)\.\.(?:\\|$)') {
+        Add-SourceStatus $State 'Unresolved candidate reference' $false $Candidate
+        return
+    }
+    try {
+        $item=Get-Item -LiteralPath $Candidate -Force -ErrorAction Stop
+        if ($item.PSIsContainer) { return }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse candidate not followed.' }
+        $record.CurrentFileExists=$true
+        if (-not $Hosts.Add($item.FullName)) { return }
+        $State.DiscoveredFiles++
+        $candidateExtension=$item.Extension -match '^(?i:\.jar|\.zip|\.dll|\.exe|\.class|\.dat|\.tmp|\.bin|\.ps1|\.bat|\.cmd|\.vbs)$'
+        $magic=Get-MagicInfo $item.FullName
+        if ($candidateExtension -or $magic.ActualType -ne 'Unknown') { [void]$Candidates.Add($item.FullName) }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        # A missing historical reference might have moved; deletion is not established.
+        if ($Source -like 'JVM*' -or [IO.Path]::GetFileName($Candidate) -match '(?i)dooms[ _-]?day') {
+            [void]$State.Findings.Add((New-Finding -CurrentName ([IO.Path]::GetFileName($Candidate)) -FullPath $Candidate -Extension ([IO.Path]::GetExtension($Candidate)) -Status 'UNKNOWN' -Verdict 'REVIEW' -EvidenceSources @($Source) -DetectionReasons @('Referenced file is currently unavailable. Neither deletion nor DoomsDay is established by this reference.')))
+        }
+        Add-SourceStatus $State 'Missing referenced file' $false $Candidate
+    } catch {
+        $State.FilesSkipped++; Add-ScanWarning $State $Source $_.Exception.Message $Candidate
+    }
+}
+
+function Get-FastPrefetchCandidates {
+    param($State,$Candidates,$Hosts,[object[]]$CurrentVolumes,[string]$Directory=(Join-Path $env:SystemRoot 'Prefetch'))
+    Write-Stage 'PREFETCH' 'Reading Java Prefetch references; no full-disk or USN scan...'
+    try { $files=@(Get-ChildItem -LiteralPath $Directory -Filter '*.pf' -File -Force -ErrorAction Stop | Where-Object { $_.Name -match '(?i)^JAVAW?\.EXE-[0-9A-F]+\.pf$' }) }
+    catch { Add-SourceStatus $State 'Java Prefetch' $false $_.Exception.Message; Add-ScanWarning $State 'PREFETCH' $_.Exception.Message; return }
+    if ($files.Count -eq 0) { Add-SourceStatus $State 'Java Prefetch' $false 'No Java Prefetch files available; absence is not cheat evidence.'; return }
+    $index=0; $failures=0
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $files) {
+        $index++; Write-ScanProgress -Current $index -Total $files.Count -Status 'Parsing Java Prefetch'
+        try {
+            if ($file.Length -gt 32MB -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Prefetch input exceeds safety bounds or is a reparse point.' }
+            $record=Read-PrefetchRecord ([IO.File]::ReadAllBytes($file.FullName))
+            if ($record.Executable -notin @('JAVA.EXE','JAVAW.EXE')) { throw 'Prefetch executable does not match Java selection.' }
+            [void]$State.Evidence.Add([pscustomobject]@{ Source='Java Prefetch metadata'; Path=$file.FullName; Version=$record.Version; Executable=$record.Executable; RunCount=$record.RunCount; LastRunTimesUtc=$record.LastRunTimesUtc; Volumes=$record.Volumes; Note='Times apply to Java, not to each referenced file.' })
+            $State.TotalIndexesExtracted += $record.References.Count
+            foreach ($reference in $record.References) {
+                if (-not $seen.Add($reference)) { continue }
+                $resolved=Resolve-PrefetchReference $reference $record.Volumes $CurrentVolumes
+                if ($resolved) { Add-FastCandidate $resolved 'Java Prefetch reference' $State $Candidates $Hosts $CurrentVolumes -Artifact $file.FullName }
+                else {
+                    [void]$State.Evidence.Add([pscustomobject]@{ Source='Unresolved Prefetch reference'; Path=$reference; Artifact=$file.FullName; Note='Current local volume could not be uniquely mapped; no path guessed.' })
+                    Add-SourceStatus $State 'Prefetch path mapping' $false $reference
+                }
+            }
+        } catch { $failures++; Add-ScanWarning $State 'PREFETCH' $_.Exception.Message $file.FullName }
+    }
+    Write-ScanProgress -Completed
+    Add-SourceStatus $State 'Java Prefetch' ($failures -eq 0) ("$($files.Count) files; $failures parse failures")
+}
+
+function Get-FastRuntimeCandidates {
+    param($State,$Candidates,$Hosts,$ModRoots,[object[]]$CurrentVolumes)
+    Write-Stage 'PROCESS' 'Collecting Java arguments and module paths (not RAM content)...'
+    try {
+        $processes=@(Get-CimInstance Win32_Process -Filter "Name='java.exe' OR Name='javaw.exe'" -ErrorAction Stop)
+        foreach ($process in $processes) {
+            $processIdValue=[int]$process.ProcessId
+            $jvm=Get-JvmArguments ([string]$process.CommandLine)
+            $record=[pscustomobject]@{ PID=$processIdValue; PPID=[int]$process.ParentProcessId; ExecutablePath=[string]$process.ExecutablePath; CommandLine=[string]$process.CommandLine; JvmArguments=$jvm; Launcher=(Get-LauncherFromCommandLine ([string]$process.CommandLine)); LoadedModules=[Collections.Generic.List[string]]::new() }
+            [void]$State.Processes.Add($record)
+            if (-not $process.CommandLine) { Add-SourceStatus $State 'JVM command line' $false "PID $processIdValue command line unavailable." }
+            foreach ($game in $jvm.GameDirectories) { if ($game -match '^[A-Za-z]:\\') { [void]$ModRoots.Add(($game.TrimEnd('\')+'\mods')) } }
+            $paths=@($jvm.Jar)
+            foreach ($agent in @($jvm.JavaAgent)+@($jvm.AgentPath)) { $paths += ($agent -split '=',2)[0] }
+            foreach ($classPath in $jvm.ClassPath) { $paths += @($classPath -split ';') }
+            foreach ($candidate in @($paths | Sort-Object -Unique)) { Add-FastCandidate $candidate 'JVM argument reference' $State $Candidates $Hosts $CurrentVolumes -ProcessId $processIdValue }
+            foreach ($argumentFile in $jvm.ArgFiles) { Add-SourceStatus $State 'JVM argument file' $false "Not expanded in Fast: $argumentFile" }
+            foreach ($agentlib in $jvm.AgentLib) { [void]$State.Evidence.Add([pscustomobject]@{ Source='JVM agentlib'; PID=$processIdValue; Library=$agentlib; Note='Agent use alone does not identify cheats.' }) }
+            $native=$null
+            try {
+                $native=Get-Process -Id $processIdValue -ErrorAction Stop
+                foreach ($module in $native.Modules) {
+                    $modulePath=[string]$module.FileName
+                    $record.LoadedModules.Add($modulePath)
+                    Add-FastCandidate $modulePath 'JVM loaded module' $State $Candidates $Hosts $CurrentVolumes -ProcessId $processIdValue
+                }
+            } catch { Add-SourceStatus $State 'JVM loaded modules' $false "PID ${processIdValue}: $($_.Exception.Message)" }
+            finally { if ($null -ne $native) { $native.Dispose() } }
+        }
+        Add-SourceStatus $State 'Java runtime references' $true "$($processes.Count) Java processes; no RAM-content inspection."
+    } catch { Add-SourceStatus $State 'Java runtime references' $false $_.Exception.Message; Add-ScanWarning $State 'PROCESS' $_.Exception.Message }
+}
+
+function Invoke-FastScan {
+    param($State,[string]$ExtraPath='')
+    Write-Section 'FAST TARGETED SCAN'
+    $State.Scope='Java Prefetch references, Java arguments/modules, direct known mods folders and optional explicit path; ADS on these hosts only. No broad AppData, USN, browser history, event-log or RAM-content scan.'
+    Write-Color $State.Scope Magenta
+    $candidates=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $hosts=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $modRoots=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $volumes=@(Get-FastLocalVolumes $State)
+    Get-FastRuntimeCandidates $State $candidates $hosts $modRoots $volumes
+    Get-FastPrefetchCandidates $State $candidates $hosts $volumes
+    foreach ($root in @(Get-MinecraftLocations)) {
+        foreach ($relative in @('mods','.minecraft\mods','minecraft\mods')) { [void]$modRoots.Add((Join-Path $root $relative)) }
+    }
+    if ($ExtraPath) {
+        if (Test-Path -LiteralPath $ExtraPath -PathType Container) { [void]$modRoots.Add($ExtraPath) }
+        else { Add-FastCandidate $ExtraPath 'Explicit file' $State $candidates $hosts $volumes }
+    }
+    Write-Stage 'INDEX' 'Collecting direct mods folders; libraries and unrelated AppData are not traversed...'
+    foreach ($root in $modRoots) {
+        if ($root -notmatch '^[A-Za-z]:\\' -or @($volumes | Where-Object { $_.Root -ieq $root.Substring(0,3) }).Count -ne 1) { continue }
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        if (((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $State.FilesSkipped++; Add-ScanWarning $State 'MODS' 'Reparse mods root not followed.' $root; continue }
+        Get-ReadOnlyFiles -Roots @($root) -State $State -Recurse | ForEach-Object {
+            Add-FastCandidate $_.FullName 'Mods folder' $State $candidates $hosts $volumes
+            Write-ScanProgress -Current $hosts.Count -Total 0 -Status ("Targeted candidates: $($candidates.Count); counting")
+        }
+    }
+    Write-ScanProgress -Completed
+    $files=@($candidates | Sort-Object)
+    Write-Stage 'SCAN' ("{0:N0} candidate files; {1} workers; all selected file bytes inspected." -f $files.Count,$script:WorkerCount)
+    if ($files.Count -gt 0) { [void](Invoke-ParallelInspection -Files $files -State $State) }
+    if ($hosts.Count -gt 0) { Invoke-AdsScan -State $State -FileInventory @($hosts) }
+    Invoke-EvidenceCorrelation $State
+}
+
 function Invoke-QuickScan {
     param($State)
     Write-Section 'QUICK SCAN'
@@ -2401,6 +2682,7 @@ function Show-ScanComplete {
     if ($null -eq $State) { throw 'Scan state is unavailable.' }
     if ($null -eq $State.CompletedUtc) { Complete-ScanState $State }
     Write-Section 'SCAN COMPLETE'
+    if ($State.Scope) { Write-Color ("Scope: $($State.Scope)") Magenta }
     $rows = [ordered]@{
         'Total indexes extracted'=$State.TotalIndexesExtracted; 'Candidate files'=$State.CandidateFiles
         'Files found'=$State.FilesFound; 'Files fully scanned'=$State.FilesFullyScanned; 'Files skipped'=$State.FilesSkipped
@@ -2441,6 +2723,8 @@ function Convert-ReportToText {
     foreach ($timing in $State.Performance.PhaseTimings) { [void]$builder.AppendLine("Phase $($timing.Phase): $($timing.Seconds) seconds") }
     [void]$builder.AppendLine("Scan ID: $($State.ScanId)")
     [void]$builder.AppendLine("Mode: $($State.Mode)")
+    [void]$builder.AppendLine("Analysis profile: $($State.AnalysisProfile)")
+    [void]$builder.AppendLine("Scope: $($State.Scope)")
     [void]$builder.AppendLine("Started UTC: $(ConvertTo-SafeDateString $State.StartedUtc)")
     [void]$builder.AppendLine("Completed UTC: $(ConvertTo-SafeDateString $State.CompletedUtc)")
     [void]$builder.AppendLine("Administrator: $($State.IsAdministrator)")
@@ -2513,6 +2797,8 @@ function Invoke-BuiltInSelfTest {
 
 function Invoke-ScanMode {
     param([string]$SelectedMode, [string]$SelectedPath = '', [switch]$DeepAds)
+    $previousProfile=$script:AnalysisProfile
+    $script:AnalysisProfile=if ($SelectedMode -eq 'Fast') { 'Signatures' } else { 'Detailed' }
     $script:InspectionCache = @{}
     $script:HashCache = @{}
     $script:ContentPlanCache.Clear()
@@ -2528,6 +2814,7 @@ function Invoke-ScanMode {
         if ($consoleGuard.Warning) { Add-ScanWarning $state 'CONSOLE' $consoleGuard.Warning }
         if (-not $state.IsAdministrator) { Write-Color '[LIMITED MODE] Administrator-only forensic sources will be skipped.' Yellow }
         switch ($SelectedMode) {
+            'Fast' { Invoke-FastScan $state $SelectedPath }
             'Quick' { Invoke-QuickScan $state }
             'Full' { Invoke-FullScan $state }
             'File' {
@@ -2553,6 +2840,7 @@ function Invoke-ScanMode {
         Export-ScanReport $state | Out-Null
         return $state
     } finally {
+        $script:AnalysisProfile=$previousProfile
         if ($null -ne $script:ScanClock) { $script:ScanClock.Stop(); $script:ScanClock=$null }
         if ($null -ne $script:PhaseClock) { $script:PhaseClock.Stop(); $script:PhaseClock=$null }
         $script:FileInventory=$null
@@ -2566,13 +2854,14 @@ function Invoke-ScanMode {
 function Show-MainMenu {
     try { Clear-Host } catch { }
     Show-RevealBanner
-    Write-Color '[1] Quick Scan' Magenta
+    Write-Color '[1] Fast Scan - Java + Prefetch + mods (recommended)' Magenta
     Write-Color '[2] Full Forensic Scan' Magenta
     Write-Color '[3] Scan File' Magenta
     Write-Color '[4] Deep ADS Scan' Magenta
     Write-Color '[5] Runtime Scan' Magenta
     Write-Color '[6] Update Signatures' Magenta
     Write-Color '[7] Export Last Report' Magenta
+    Write-Color '[8] Minecraft Directory Scan (broader)' Magenta
     Write-Color '[0] Exit' Magenta
 }
 
@@ -2582,13 +2871,14 @@ function Start-DoomsDayFinderMenu {
         $choice = Read-Host 'Select'
         try {
             switch ($choice) {
-                '1' { Invoke-ScanMode 'Quick' | Out-Null }
+                '1' { Invoke-ScanMode 'Fast' | Out-Null }
                 '2' { Invoke-ScanMode 'Full' | Out-Null }
                 '3' { $file = (Read-Host 'Enter the full path of the file').Trim('"'); Invoke-ScanMode 'File' $file | Out-Null }
                 '4' { $root = (Read-Host 'Optional root path (press Enter for default locations)').Trim('"'); Invoke-ScanMode 'ADS' $root -DeepAds | Out-Null }
                 '5' { Invoke-ScanMode 'Runtime' | Out-Null }
                 '6' { Update-DoomsDaySignatures | Out-Null }
                 '7' { Export-ScanReport | Out-Null }
+                '8' { Invoke-ScanMode 'Quick' | Out-Null }
                 '0' { return }
                 default { Write-Color '[WARNING] Invalid selection.' Yellow }
             }
