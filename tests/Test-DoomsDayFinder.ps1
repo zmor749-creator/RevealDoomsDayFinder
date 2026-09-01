@@ -368,6 +368,15 @@ function New-PrefetchFixture {
     return ,([byte[]]($prefix+$names+$volume))
 }
 
+Test-Case 'Review findings show their full path in the console, not just a truncated filename' {
+    Set-TestDatabase
+    $s=New-ScanState Fast
+    [void]$s.Findings.Add((New-Finding -CurrentName 'DoomsDay.jar' -FullPath 'C:\fixture\full-path\DoomsDay.jar' -Verdict REVIEW -Status UNKNOWN -DetectionReasons @('Filename-only fixture.')))
+    Complete-ScanState $s
+    $output=Show-ScanComplete $s 6>&1 | Out-String
+    Assert-True ($output.Contains('C:\fixture\full-path\DoomsDay.jar'))
+}
+
 Test-Case 'Prefetch supported layouts extract Unicode paths, volumes and run count' {
     $unicodeName='\VOLUME{fixture-volume}\Users\'+[char]0x00D6+'MER ATLAS\renamed.png'
     foreach ($version in @(26,30,31)) {

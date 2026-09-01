@@ -2710,7 +2710,7 @@ function Show-ScanComplete {
         Write-Color 'No DoomsDay indicators were detected in the evidence sources that were successfully analyzed.' Green
     }
     Show-FindingsTable $State
-    foreach ($finding in @($State.Findings | Where-Object { $null -ne $_ -and $_.Verdict -in @('DETECTED','HIGH CONFIDENCE','SUSPICIOUS','INCONCLUSIVE','DELETED TRACE','RUNTIME TRACE') })) { Show-FindingDetail $finding }
+    foreach ($finding in @($State.Findings | Where-Object { $null -ne $_ })) { Show-FindingDetail $finding }
 }
 
 function Convert-ReportToText {
