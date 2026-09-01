@@ -1,6 +1,6 @@
 # Reveal ScreenShare — DoomsDay Finder
 
-Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.2.1.
+Windows 10/11 x64 için PowerShell tabanlı, kanıtları değiştirmeden okuyan inceleme aracı. Ana dosya `DoomsDayFinder.ps1`, sürüm 1.2.2.
 
 **Araştırma sürümü: otomatik ban aracı değildir. Doğrulanmış DoomsDay örnek corpus'u ve ölçülmüş tespit oranı yoktur. “%100” veya “neredeyse %100” tespit iddiası yapılmaz.**
 
@@ -50,6 +50,27 @@ Full kapsamı hız için daraltılmaz. Tekrar okumalar cache ile azaltılır; ba
 Taramanın içinde `Read-Host`, tuş veya Enter beklemesi yoktur. Eski Windows konsolundaki fareyle seçim duraklamasına karşı, yalnızca tarama boyunca QuickEdit kapatılır ve `finally` içinde önceki konsol modu geri yüklenir. Bu işlem PowerShell/.NET Reflection.Emit ile yalnızca `GetStdHandle`, `GetConsoleMode`, `SetConsoleMode` API'lerini bağlar; C# derlemez, kayıt defterine yazmaz ve CTRL+C davranışını korur. Konsol bulunmayan host'larda uygulanmaz; politika veya API hatasında uyarı verilir. Zorla süreç kapatılırsa geri yükleme garantisi yoktur. Menüdeki kullanıcı seçimi ve tarama sonrası menüye dönme istemi ayrı davranışlardır; `-Mode Full` bunları kullanmaz.
 
 İlgili Windows davranışı: [SetConsoleMode](https://learn.microsoft.com/en-us/windows/console/setconsolemode), [konsol modunu geri yükleme](https://learn.microsoft.com/en-us/windows/console/console-modes). Eski sürüm zaten metin seçimiyle duraklatılmışsa önce Esc, ardından Ctrl+C ile durdurup yeni sürümü çalıştırın.
+
+### 1.2.2 performans değişiklikleri
+
+- Java class ayrıştırıcısında her sabit alan için PowerShell fonksiyonu çağırma ve tüm `switch` koşullarını değerlendirme maliyeti kaldırıldı. Alanlar ve sınır kontrolleri korunur.
+- İçerik eşleştirme planları arşiv başına hazırlanır; imza metadata'sı cache'ten eski haliyle alınmaz. Okuma tamponu küçük entry'lere göre küçülür, büyük dosyalarda 1 MiB olur; sınırdan geçen imzalar örtüşmeli okunur.
+- Aynı SHA-256'ya sahip class içeriğinin ayrıştırılmış sonucu tekrar kullanılabilir. Her entry'nin tüm byte'ları yine okunur, hash ve imzaları kontrol edilir. Cache en fazla 8192 kayıt ve yaklaşık 64 MiB maliyet bütçesiyle sınırlıdır; gerçek süreç RAM sınırı değildir. Bağımsız VERIFY bu class cache'ini kullanmaz.
+- Arşiv dışındaki dosyalarda hash, aile byte imzaları ve ek araç göstergeleri tek içerik geçişinde kontrol edilir. Ek araç göstergeleri aile imzası olarak puanlanmaz.
+- ADS byte araması PowerShell'de byte başına döngü yerine aynı bloklu motoru kullanır; UTF-8/UTF-16 eşleşmeleri korunur.
+- Full taramanın ilk keşif listesi ADS ve tarayıcı veritabanı konumlarında tekrar kullanılır; aynı dizinler tekrar gezilmez. Zone.Identifier tekrar okunmadan tarayıcı bağlamına dönüştürülür. Tarama sırasında sonradan oluşan dosyalar bu keşif anındaki listeye dahil değildir; gerekirse yeni tarama gerekir.
+- Temiz arşivlerin ayrıntılı class/resource ağaçları sırf cache için tutulmaz; özet kanıt ve fingerprint'ler korunur. Açıkça ayrıntılı finding istenirse yeniden incelenir. Ana tarama bittiğinde çalışma cache'leri bırakılır.
+- Mor satırda geçen süre; JSON/TXT raporda aşama süreleri ve cache sayaçları bulunur. Bu süreler bir sonraki darboğazı kanıtla belirlemek içindir.
+
+Hedef 10–15 dakikaya yaklaşmaktır; **tüm bilgisayarlarda 15 dakikada tamamlama garantisi veya gizli süre kesintisi yoktur**. Kaynak kapsamı ve class sayısı sınırlandırılmaz. Özellikle büyük AppData dizinleri, yavaş disk, çok sayıda farklı class veya büyük USN journal daha uzun sürebilir.
+
+Tekrarlanabilir sentetik benchmark (tespit başarısı ölçümü değildir):
+
+```powershell
+.\tests\Measure-DoomsDayFinder.ps1 -ClassCount 300 -ConstantsPerClass 1000
+```
+
+Benchmark ayrı geçici dizinde çalıştırılmayan JAR fixture'ları oluşturur, ilk analiz ve aynı içerikli başka isimdeki dosyanın analiz süresini; class sayısını ve fingerprint'leri yazdırır. Aynı parametrelerle önceki ve yeni sürüm kıyaslanabilir. Bu mikrobenchmark oranı tüm Full taramanın hızlanma oranı olarak kullanılamaz.
 
 ## İmzalar ve kararlar
 

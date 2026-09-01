@@ -16,3 +16,6 @@ jobs:
       - name: PowerShell 7 synthetic regression suite
         shell: pwsh
         run: ./tests/Test-DoomsDayFinder.ps1
+      - name: Windows PowerShell synthetic performance sample
+        shell: powershell
+        run: ./tests/Measure-DoomsDayFinder.ps1
